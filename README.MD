@@ -137,7 +137,20 @@ The script includes an "Advanced Settings" group with fine-tuning options:
 
 1. Configure the script in OBS Studio settings
 2. Set hotkeys to enable/disable zoom and tracking
-3. During recording or live streaming, use the hotkeys to control the zoom and tracking effects
+3. **IMPORTANT**: Before activating zoom, ensure your source is fitted to the screen:
+   - Select your source in OBS
+   - Press **CTRL+F** (or right-click → "Adatta allo schermo" / "Fit to Screen")
+   - This ensures optimal zoom behavior and accurate mouse tracking
+4. During recording or live streaming, use the hotkeys to control the zoom and tracking effects
+
+### Source Setup Requirements
+
+**For best results, fit your source to screen before activating zoom:**
+
+- **Recommended**: Press **CTRL+F** on your source before activating zoom
+- The script will automatically detect if the source is fitted and show a warning if it's not
+- If the source is not fitted, zoom may still work but with reduced accuracy
+- After fitting (CTRL+F), you can still crop or resize the source - zoom will continue to work correctly
 
 ## Main Functions
 
@@ -181,6 +194,13 @@ If you encounter issues with the script, try:
 - Adjust "Follow Speed" (lower = smoother)
 - Increase "Mouse Deadzone" if too sensitive
 - Check "Update Interval" is appropriate for your system
+
+**Zoom behavior is incorrect or source appears to resize:**
+
+- **Solution**: Press **CTRL+F** on your source before activating zoom
+- This fits the source to the screen and ensures accurate mouse-to-crop mapping
+- The script will show a warning in the logs if the source is not fitted
+- After fitting, you can still crop or resize the source - zoom will work correctly
 
 ## Support
 

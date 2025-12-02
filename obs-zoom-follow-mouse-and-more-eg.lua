@@ -402,6 +402,7 @@ local app_state = {
         speed = 0.2
     },
     source = nil,
+    source_scene_item = nil, -- Scene item reference for getting transformations
     crop_filter = nil,
     crop_filter_owned = false, -- Track if filter was created by us (needs release) or borrowed (no release)
     original_crop = nil,
@@ -454,6 +455,11 @@ local function reset_state()
     app_state.follow.active = false
     app_state.current_crop = nil
     app_state.target_crop = nil
+    app_state.source_scene_item = nil
+    -- Reset dimension tracking flags
+    app_state._dimension_warning_logged = false
+    app_state._filter_just_applied = false
+    app_state._filter_apply_time = nil
 end
 
 -- ============================================================================
@@ -461,8 +467,10 @@ end
 -- ============================================================================
 
 -- Enhanced logging function with levels
+-- Only shows logs when debug_mode is enabled
 local function log(level, message)
-    if not app_state.debug_mode and level ~= "error" then
+    -- Only show logs if debug_mode is enabled
+    if not app_state.debug_mode then
         return
     end
     
@@ -529,10 +537,12 @@ local function find_valid_video_source()
     end
     
     local valid_source = nil
+    local valid_scene_item = nil
     for _, item in ipairs(items) do
         local item_source = obs.obs_sceneitem_get_source(item)
         valid_source = check_source(item_source)
         if valid_source then
+            valid_scene_item = item
             break
         end
     end
@@ -546,8 +556,11 @@ local function find_valid_video_source()
     if valid_source then
         -- Note: Sources from scene items are managed by OBS, no need to addref/release
         log("info", "Found valid video source: " .. obs.obs_source_get_name(valid_source))
+        -- Store scene item reference for getting transformations
+        app_state.source_scene_item = valid_scene_item
     else
         log("info", "No valid video source found in the current scene")
+        app_state.source_scene_item = nil
     end
     
     return valid_source
@@ -706,6 +719,10 @@ local function apply_crop_filter(target_source)
     -- OBS may need a moment to update the source dimensions. The dimensions will be
     -- validated when get_target_crop() is called, which has retry logic.
     
+    -- Set a flag to indicate we just applied the filter, so we wait before using dimensions
+    app_state._filter_just_applied = true
+    app_state._filter_apply_time = obs.os_gettime_ns() / 1000000 -- milliseconds
+    
     return true
 end
 
@@ -748,6 +765,22 @@ local function update_crop(left, top, right, bottom)
     
     obs.obs_data_release(settings)
 end
+
+-- Simple informational message about CTRL+F
+-- Note: OBS API doesn't provide a reliable way to detect if source is fitted to screen
+-- So we just show an informational message suggesting to use CTRL+F
+local function show_fit_to_screen_info()
+    if app_state.debug_mode then
+        log("info", "💡 Tip: For best zoom results, press CTRL+F to fit source to screen before activating zoom")
+    end
+end
+
+-- OLD FUNCTION REMOVED - Unreliable detection logic
+-- The function check_source_fitted_to_screen() was removed because:
+-- 1. Canvas dimensions from obs_video_info() are often 0x0
+-- 2. Scale information cannot be retrieved reliably (obs_sceneitem_get_scale fails)
+-- 3. Detection was inaccurate and showed warnings even when CTRL+F was applied
+-- Replaced with simple informational message: show_fit_to_screen_info()
 
 -- Calculate target crop based on mouse position and zoom
 local function get_target_crop(mouse_x, mouse_y, current_zoom)
@@ -801,9 +834,30 @@ local function get_target_crop(mouse_x, mouse_y, current_zoom)
     -- According to OBS documentation (obs_source_get_width/height), these functions call
     -- the source's get_width/get_height callbacks, which may return 0 if the source
     -- dimensions are not yet available (e.g., immediately after filter application).
-    -- We check once and if dimensions are 0, we return empty crop and let the next
-    -- frame (via the animation timer) handle it. This is the correct approach per OBS docs.
+    -- We wait a short time after filter application before trying to get dimensions.
     local source_width, source_height
+    
+    -- If filter was just applied, wait at least 50ms before trying to get dimensions
+    if app_state._filter_just_applied and app_state._filter_apply_time then
+        local current_time = obs.os_gettime_ns() / 1000000 -- milliseconds
+        local elapsed = current_time - app_state._filter_apply_time
+        if elapsed < 50 then
+            -- Still waiting for dimensions to become available
+            if not app_state._dimension_warning_logged then
+                if app_state.debug_mode then
+                    log("info", string.format("Waiting for source dimensions to become available (elapsed: %dms). Target: %s", 
+                        math.floor(elapsed), target_name))
+                end
+                app_state._dimension_warning_logged = true
+            end
+            return {left = 0, top = 0, right = 0, bottom = 0}
+        else
+            -- Enough time has passed, clear the flag
+            app_state._filter_just_applied = false
+            app_state._filter_apply_time = nil
+        end
+    end
+    
     local success, width_result, height_result = pcall(function()
         return obs.obs_source_get_width(target), obs.obs_source_get_height(target)
     end)
@@ -815,12 +869,20 @@ local function get_target_crop(mouse_x, mouse_y, current_zoom)
         -- If dimensions are valid, proceed with crop calculation
         if source_width > 0 and source_height > 0 then
             -- Dimensions are valid, continue with crop calculation below
+            -- Reset warning flag when dimensions become valid
+            if app_state._dimension_warning_logged then
+                if app_state.debug_mode then
+                    log("info", string.format("Source dimensions now available: %dx%d. Target: %s", 
+                        source_width, source_height, target_name))
+                end
+                app_state._dimension_warning_logged = false
+            end
         else
-            -- Dimensions are 0 - this is expected immediately after filter application
-            -- per OBS documentation. The source dimensions will be available on the next frame.
-            -- Return empty crop and let the animation timer retry on next frame.
-            if app_state.debug_mode and not app_state._dimension_warning_logged then
+            -- Dimensions are still 0 - retry on next frame
+            -- Only log once to avoid spam
+            if not app_state._dimension_warning_logged then
                 log("info", string.format("Source dimensions not yet available (0x0) - will retry on next frame. Target: %s", target_name))
+                app_state._dimension_warning_logged = true
             end
             return {left = 0, top = 0, right = 0, bottom = 0}
         end
@@ -832,14 +894,7 @@ local function get_target_crop(mouse_x, mouse_y, current_zoom)
         return {left = 0, top = 0, right = 0, bottom = 0}
     end
     
-    -- Reset warning flag if dimensions are now valid
-    if source_width > 0 and source_height > 0 then
-        if app_state._dimension_warning_logged then
-            log("info", string.format("Filter target dimensions now valid: %dx%d (target: %s, type: %s)", 
-                source_width, source_height, target_name, target_type))
-            app_state._dimension_warning_logged = false
-        end
-    end
+    -- Reset warning flag if dimensions are now valid (already handled above)
     
     
     -- Find monitor where mouse is located
@@ -859,14 +914,63 @@ local function get_target_crop(mouse_x, mouse_y, current_zoom)
         return {left = 0, top = 0, right = 0, bottom = 0}
     end
     
-    local scale_x = source_width / screen_width
-    local scale_y = source_height / screen_height
+    -- Get displayed dimensions considering scene item transformations (scale, crop)
+    -- Note: This is used for mouse-to-source coordinate mapping, not for detecting if source is fitted
+    local displayed_width = source_width
+    local displayed_height = source_height
+    
+    if app_state.source_scene_item then
+        local scale_x, scale_y = 1.0, 1.0
+        local success = pcall(function()
+            -- Try to create vec2 and get scale
+            if obs.vec2 then
+                local scale_vec = obs.vec2()
+                obs.obs_sceneitem_get_scale(app_state.source_scene_item, scale_vec)
+                scale_x = scale_vec.x
+                scale_y = scale_vec.y
+            else
+                -- Fallback: try direct call
+                local scale_result = obs.obs_sceneitem_get_scale(app_state.source_scene_item)
+                if scale_result and type(scale_result) == "table" then
+                    scale_x = scale_result.x or 1.0
+                    scale_y = scale_result.y or 1.0
+                end
+            end
+        end)
+        
+        if scale_x and scale_y then
+            
+            -- Get crop applied to scene item (if any)
+            local crop_success, crop_result = pcall(function()
+                return obs.obs_sceneitem_get_crop(app_state.source_scene_item)
+            end)
+            
+            if crop_success and crop_result then
+                -- Calculate displayed dimensions: (native - crop) * scale
+                displayed_width = (source_width - (crop_result.left or 0) - (crop_result.right or 0)) * scale_x
+                displayed_height = (source_height - (crop_result.top or 0) - (crop_result.bottom or 0)) * scale_y
+            else
+                -- No crop, just apply scale
+                displayed_width = source_width * scale_x
+                displayed_height = source_height * scale_y
+            end
+        end
+    end
+    
+    -- Use displayed dimensions for crop calculation
+    -- Map mouse position from screen space to source native space
+    -- If source is displayed at displayed_width x displayed_height on screen,
+    -- then: mouse_x_in_source = (mouse_x - monitor.left) * (source_width / displayed_width)
+    -- This works correctly when source is fitted to screen (CTRL+F)
+    -- When not fitted, the mapping may be less accurate but still functional
+    local mouse_x_in_source = (mouse_x - current_monitor.left) * (source_width / displayed_width)
+    local mouse_y_in_source = (mouse_y - current_monitor.top) * (source_height / displayed_height)
     
     local target_width = math.floor(source_width / current_zoom)
     local target_height = math.floor(source_height / current_zoom)
     
-    local target_x = math.floor((mouse_x - current_monitor.left) * scale_x - (target_width / 2))
-    local target_y = math.floor((mouse_y - current_monitor.top) * scale_y - (target_height / 2))
+    local target_x = math.floor(mouse_x_in_source - (target_width / 2))
+    local target_y = math.floor(mouse_y_in_source - (target_height / 2))
     
     target_x = math.max(0, math.min(target_x, source_width - target_width))
     target_y = math.max(0, math.min(target_y, source_height - target_height))
@@ -992,6 +1096,7 @@ local function animate_zoom()
         end
         -- Note: Sources from scene items are managed by OBS, no need to release
         app_state.source = nil
+        app_state.source_scene_item = nil
         return
     end
     
@@ -1232,6 +1337,11 @@ local function on_zoom_hotkey(pressed)
         return
     end
     
+    -- Show informational message about CTRL+F (only in debug mode)
+    -- Note: OBS API doesn't provide a reliable way to detect if source is fitted to screen
+    -- So we just show a helpful tip instead of trying to detect it
+    show_fit_to_screen_info()
+    
     if app_state.zoom.active then
         -- Deactivate zoom
         log("info", "Deactivating zoom - stopping all timers immediately")
@@ -1380,6 +1490,7 @@ local function on_scene_change()
         
         -- Note: Sources from scene items are managed by OBS, no need to release
         app_state.source = nil
+        app_state.source_scene_item = nil
         
         -- Release old filter reference only if we created it
         -- Filters obtained with obs_source_get_filter_by_name are borrowed and shouldn't be released
@@ -1524,6 +1635,7 @@ local function cleanup_all_resources()
     
     -- Note: Sources from scene items are managed by OBS, no need to release
     app_state.source = nil
+    app_state.source_scene_item = nil
     
     -- Release scene reference (protected with pcall to prevent crashes)
     if app_state.current_scene then
@@ -1665,10 +1777,12 @@ function script_load(settings)
     -- Update settings
     script_update(settings)
     
-    -- Apply filter to current scene at startup
+    -- NOTE: Do NOT apply filter automatically at startup
+    -- Filter will be applied only when zoom is activated via hotkey
+    -- This prevents issues during script reload and conflicts with other scripts
     app_state.source = find_valid_video_source()
-    if app_state.source then
-        apply_crop_filter(app_state.source)
+    if app_state.source and app_state.debug_mode then
+        log("info", "Script loaded - source found but filter not applied until zoom is activated")
     end
 end
 
@@ -1685,6 +1799,47 @@ end
 
 -- Script unloading
 function script_unload()
-    cleanup_all_resources()
+    -- CRITICAL: Ensure all timers are stopped and filters removed before cleanup
+    -- This prevents any operations on sources/scenes after script is unloaded
+    if app_state then
+        -- Stop all timers immediately
+        if app_state.animation_timer then
+            pcall(function() obs.timer_remove(animate_zoom) end)
+            app_state.animation_timer = nil
+        end
+        if app_state.zoom_out_timer then
+            pcall(function() obs.timer_remove(app_state.zoom_out_timer) end)
+            app_state.zoom_out_timer = nil
+        end
+        
+        -- Remove filter but DO NOT release source references
+        -- Sources are managed by OBS, we should never release them
+        if app_state.crop_filter and app_state.current_filter_target then
+            pcall(function()
+                obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
+            end)
+            -- Only release filter if we created it
+            if app_state.crop_filter_owned then
+                pcall(function()
+                    obs.obs_source_release(app_state.crop_filter)
+                end)
+            end
+        end
+        
+        -- Clear references (but DO NOT release sources - they're managed by OBS)
+        app_state.source = nil
+        app_state.source_scene_item = nil
+        app_state.current_filter_target = nil
+        app_state.crop_filter = nil
+        app_state.crop_filter_owned = false
+    end
+    
+    -- Cleanup FFI resources
+    ffi_platform.cleanup()
+    
+    -- Reset state
+    if app_state then
+        reset_state()
+    end
 end
 
