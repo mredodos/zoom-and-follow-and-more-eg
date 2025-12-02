@@ -1,0 +1,1061 @@
+-- ============================================================================
+-- Zoom, Follow Mouse and MORE for OBS Studio
+-- Version 2.0.0 (Refactored 2025)
+-- ============================================================================
+
+local obs = obslua
+local ffi = require("ffi")
+
+-- ============================================================================
+-- CONSTANTS
+-- ============================================================================
+
+local ZOOM_HOTKEY_NAME = "zoom_and_follow.zoom.toggle"
+local FOLLOW_HOTKEY_NAME = "zoom_and_follow.follow.toggle"
+local CROP_FILTER_NAME = "zoom_and_follow_crop"
+local UPDATE_INTERVAL = 16 -- milliseconds (approximately 60 FPS)
+local MOUSE_CACHE_DURATION = 8 -- milliseconds (max 120 FPS)
+local ZOOM_ANIMATION_DURATION = 300 -- milliseconds
+local ZOOM_OUT_DURATION = 500 -- milliseconds
+local SCENE_TRANSITION_DURATION = 300 -- milliseconds
+local DEFAULT_MONITOR_WIDTH = 1920
+local DEFAULT_MONITOR_HEIGHT = 1080
+local MAX_DISPLAYS = 32 -- Maximum displays for macOS
+
+-- Valid video source types
+local VALID_SOURCE_TYPES = {
+    "ffmpeg_source",
+    "browser_source",
+    "vlc_source",
+    "monitor_capture",
+    "window_capture",
+    "game_capture",
+    "dshow_input",
+    "av_capture_input"
+}
+
+-- ============================================================================
+-- FFI PLATFORM MODULE
+-- ============================================================================
+
+local ffi_platform = {
+    initialized = false,
+    os_type = nil,
+    -- Windows
+    windows_loaded = false,
+    -- Linux
+    x11 = nil,
+    xrandr = nil,
+    x11_display = nil,
+    x11_root = nil,
+    -- macOS
+    core_graphics = nil,
+    -- Monitors cache
+    monitors = {},
+    -- Mouse position cache
+    mouse_cache = {x = 0, y = 0, timestamp = 0}
+}
+
+-- Initialize FFI definitions for Windows
+local function init_windows_ffi()
+    if ffi_platform.windows_loaded then
+        return true
+    end
+    
+    local success, err = pcall(function()
+        ffi.cdef[[
+            typedef long BOOL;
+            typedef void* HANDLE;
+            typedef HANDLE HMONITOR;
+            typedef struct {
+                long left;
+                long top;
+                long right;
+                long bottom;
+            } RECT;
+            typedef struct {
+                unsigned long cbSize;
+                RECT rcMonitor;
+                RECT rcWork;
+                unsigned long dwFlags;
+            } MONITORINFO;
+            typedef BOOL (*MONITORENUMPROC)(HMONITOR, void*, RECT*, long);
+            
+            BOOL EnumDisplayMonitors(void*, void*, MONITORENUMPROC, long);
+            BOOL GetMonitorInfoA(HMONITOR, MONITORINFO*);
+            typedef struct { long x; long y; } POINT;
+            bool GetCursorPos(POINT* point);
+        ]]
+        ffi_platform.windows_loaded = true
+    end)
+    
+    if not success then
+        return false, err
+    end
+    return true
+end
+
+-- Initialize FFI definitions and handles for Linux
+local function init_linux_ffi()
+    if ffi_platform.x11_display ~= nil then
+        return true
+    end
+    
+    local success, err = pcall(function()
+        ffi.cdef[[
+            typedef struct {
+                int x, y;
+                int width, height;
+            } XRRMonitorInfo;
+            
+            typedef void* Display;
+            typedef unsigned long Window;
+            
+            Display* XOpenDisplay(const char*);
+            void XCloseDisplay(Display*);
+            Window DefaultRootWindow(Display*);
+            XRRMonitorInfo* XRRGetMonitors(Display*, Window, int, int*);
+            void XRRFreeMonitors(XRRMonitorInfo*);
+            
+            typedef struct {
+                int x, y;
+                int dummy1, dummy2, dummy3;
+                int dummy4, dummy5, dummy6;
+            } XButtonEvent;
+            
+            int XQueryPointer(Display*, Window, Window*, Window*, int*, int*, int*, int*, unsigned int*);
+        ]]
+        
+        ffi_platform.x11 = ffi.load("X11")
+        ffi_platform.xrandr = ffi.load("Xrandr")
+        
+        ffi_platform.x11_display = ffi_platform.x11.XOpenDisplay(nil)
+        if ffi_platform.x11_display ~= nil then
+            ffi_platform.x11_root = ffi_platform.x11.DefaultRootWindow(ffi_platform.x11_display)
+        end
+    end)
+    
+    if not success then
+        return false, err
+    end
+    
+    if ffi_platform.x11_display == nil then
+        return false, "Failed to open X11 display"
+    end
+    
+    return true
+end
+
+-- Initialize FFI definitions and handles for macOS
+local function init_macos_ffi()
+    if ffi_platform.core_graphics ~= nil then
+        return true
+    end
+    
+    local success, err = pcall(function()
+        ffi.cdef[[
+            typedef struct CGDirectDisplayID *CGDirectDisplayID;
+            typedef uint32_t CGDisplayCount;
+            typedef struct CGRect CGRect;
+            typedef struct CGPoint CGPoint;
+            
+            int CGGetActiveDisplayList(CGDisplayCount maxDisplays, CGDirectDisplayID *activeDisplays, CGDisplayCount *displayCount);
+            CGRect CGDisplayBounds(CGDirectDisplayID display);
+            CGPoint CGEventGetLocation(void* event);
+            void* CGEventCreate(void* source);
+            void CFRelease(void* cf);
+        ]]
+        
+        ffi_platform.core_graphics = ffi.load("CoreGraphics", true)
+    end)
+    
+    if not success then
+        return false, err
+    end
+    
+    return true
+end
+
+-- Initialize FFI platform module
+function ffi_platform.init()
+    if ffi_platform.initialized then
+        return true
+    end
+    
+    ffi_platform.os_type = ffi.os
+    local success, err
+    
+    if ffi_platform.os_type == "Windows" then
+        success, err = init_windows_ffi()
+    elseif ffi_platform.os_type == "Linux" then
+        success, err = init_linux_ffi()
+    elseif ffi_platform.os_type == "OSX" then
+        success, err = init_macos_ffi()
+    else
+        -- Fallback for unknown OS
+        ffi_platform.monitors = {{left = 0, top = 0, right = DEFAULT_MONITOR_WIDTH, bottom = DEFAULT_MONITOR_HEIGHT}}
+        ffi_platform.initialized = true
+        return true
+    end
+    
+    if not success then
+        return false, err
+    end
+    
+    ffi_platform.initialized = true
+    return true
+end
+
+-- Get monitors information
+function ffi_platform.get_monitors()
+    if not ffi_platform.initialized then
+        return {}
+    end
+    
+    if #ffi_platform.monitors > 0 then
+        return ffi_platform.monitors
+    end
+    
+    local monitors = {}
+    
+    if ffi_platform.os_type == "Windows" then
+        local function enum_callback(hMonitor, _, _, _)
+            local mi = ffi.new("MONITORINFO")
+            mi.cbSize = ffi.sizeof("MONITORINFO")
+            if ffi.C.GetMonitorInfoA(hMonitor, mi) ~= 0 then
+                table.insert(monitors, {
+                    left = mi.rcMonitor.left,
+                    top = mi.rcMonitor.top,
+                    right = mi.rcMonitor.right,
+                    bottom = mi.rcMonitor.bottom
+                })
+            end
+            return true
+        end
+        
+        local callback = ffi.cast("MONITORENUMPROC", enum_callback)
+        ffi.C.EnumDisplayMonitors(nil, nil, callback, 0)
+        callback:free()
+        
+    elseif ffi_platform.os_type == "Linux" then
+        if ffi_platform.x11_display ~= nil then
+            local count = ffi.new("int[1]")
+            local info = ffi_platform.xrandr.XRRGetMonitors(ffi_platform.x11_display, ffi_platform.x11_root, 1, count)
+            
+            if info ~= nil then
+                for i = 0, count[0] - 1 do
+                    table.insert(monitors, {
+                        left = info[i].x,
+                        top = info[i].y,
+                        right = info[i].x + info[i].width,
+                        bottom = info[i].y + info[i].height
+                    })
+                end
+                ffi_platform.xrandr.XRRFreeMonitors(info)
+            end
+        end
+        
+    elseif ffi_platform.os_type == "OSX" then
+        if ffi_platform.core_graphics ~= nil then
+            local active_displays = ffi.new("CGDirectDisplayID[?]", MAX_DISPLAYS)
+            local display_count = ffi.new("CGDisplayCount[1]")
+            
+            if ffi_platform.core_graphics.CGGetActiveDisplayList(MAX_DISPLAYS, active_displays, display_count) == 0 then
+                for i = 0, display_count[0] - 1 do
+                    local bounds = ffi_platform.core_graphics.CGDisplayBounds(active_displays[i])
+                    table.insert(monitors, {
+                        left = bounds.origin.x,
+                        top = bounds.origin.y,
+                        right = bounds.origin.x + bounds.size.width,
+                        bottom = bounds.origin.y + bounds.size.height
+                    })
+                end
+            end
+        end
+    else
+        -- Fallback for unknown OS
+        monitors = {{left = 0, top = 0, right = DEFAULT_MONITOR_WIDTH, bottom = DEFAULT_MONITOR_HEIGHT}}
+    end
+    
+    ffi_platform.monitors = monitors
+    return monitors
+end
+
+-- Get mouse position with caching
+function ffi_platform.get_mouse_pos()
+    if not ffi_platform.initialized then
+        return 0, 0
+    end
+    
+    -- Check cache validity
+    local current_time = obs.os_gettime_ns() / 1000000 -- Convert to milliseconds
+    if current_time - ffi_platform.mouse_cache.timestamp < MOUSE_CACHE_DURATION then
+        return ffi_platform.mouse_cache.x, ffi_platform.mouse_cache.y
+    end
+    
+    local x, y = 0, 0
+    local success = false
+    
+    if ffi_platform.os_type == "Windows" then
+        local success_pcall, result = pcall(function()
+            local point = ffi.new("POINT[1]")
+            if ffi.C.GetCursorPos(point) then
+                return point[0].x, point[0].y
+            end
+            return 0, 0
+        end)
+        if success_pcall then
+            x, y = result
+            success = true
+        end
+        
+    elseif ffi_platform.os_type == "Linux" then
+        if ffi_platform.x11_display ~= nil then
+            local success_pcall, result = pcall(function()
+                local root_x = ffi.new("int[1]")
+                local root_y = ffi.new("int[1]")
+                local win_x = ffi.new("int[1]")
+                local win_y = ffi.new("int[1]")
+                local mask = ffi.new("unsigned int[1]")
+                local child = ffi.new("Window[1]")
+                local child_revert = ffi.new("Window[1]")
+                
+                if ffi_platform.x11.XQueryPointer(ffi_platform.x11_display, ffi_platform.x11_root, 
+                                                  child_revert, child, root_x, root_y, win_x, win_y, mask) ~= 0 then
+                    return root_x[0], root_y[0]
+                end
+                return 0, 0
+            end)
+            if success_pcall then
+                x, y = result
+                success = true
+            end
+        end
+        
+    elseif ffi_platform.os_type == "OSX" then
+        if ffi_platform.core_graphics ~= nil then
+            local success_pcall, result = pcall(function()
+                local event = ffi_platform.core_graphics.CGEventCreate(nil)
+                if event ~= nil then
+                    local point = ffi_platform.core_graphics.CGEventGetLocation(event)
+                    ffi_platform.core_graphics.CFRelease(event)
+                    return point.x, point.y
+                end
+                return 0, 0
+            end)
+            if success_pcall then
+                x, y = result
+                success = true
+            end
+        end
+    end
+    
+    -- Update cache
+    if success then
+        ffi_platform.mouse_cache.x = x
+        ffi_platform.mouse_cache.y = y
+        ffi_platform.mouse_cache.timestamp = current_time
+    end
+    
+    return x, y
+end
+
+-- Cleanup FFI platform resources
+function ffi_platform.cleanup()
+    if ffi_platform.os_type == "Linux" and ffi_platform.x11_display ~= nil then
+        pcall(function()
+            ffi_platform.x11.XCloseDisplay(ffi_platform.x11_display)
+        end)
+        ffi_platform.x11_display = nil
+        ffi_platform.x11_root = nil
+        ffi_platform.x11 = nil
+        ffi_platform.xrandr = nil
+    end
+    
+    ffi_platform.monitors = {}
+    ffi_platform.mouse_cache = {x = 0, y = 0, timestamp = 0}
+    ffi_platform.initialized = false
+end
+
+-- ============================================================================
+-- STATE MANAGEMENT
+-- ============================================================================
+
+local app_state = {
+    zoom = {
+        active = false,
+        value = 3.0,
+        speed = 0.2,
+        current = 1.0,
+        target = 1.0,
+        start_time = 0
+    },
+    follow = {
+        active = false,
+        speed = 0.2
+    },
+    source = nil,
+    crop_filter = nil,
+    original_crop = nil,
+    current_crop = nil,
+    target_crop = nil,
+    current_scene = nil,
+    current_filter_target = nil,
+    animation_timer = nil,
+    monitors = {},
+    zoom_hotkey_id = nil,
+    follow_hotkey_id = nil,
+    debug_mode = false
+}
+
+-- Validate state consistency
+local function validate_state()
+    if app_state.zoom.active and not app_state.source then
+        app_state.zoom.active = false
+        app_state.follow.active = false
+        return false
+    end
+    if app_state.follow.active and not app_state.zoom.active then
+        app_state.follow.active = false
+        return false
+    end
+    return true
+end
+
+-- Reset state to default
+local function reset_state()
+    app_state.zoom.active = false
+    app_state.zoom.current = 1.0
+    app_state.zoom.target = 1.0
+    app_state.follow.active = false
+    app_state.current_crop = nil
+    app_state.target_crop = nil
+end
+
+-- ============================================================================
+-- UTILITY FUNCTIONS
+-- ============================================================================
+
+-- Enhanced logging function with levels
+local function log(level, message)
+    if not app_state.debug_mode and level ~= "error" then
+        return
+    end
+    
+    local prefix = "[Zoom and Follow]"
+    if level == "error" then
+        print(prefix .. " [ERROR] " .. message)
+    elseif level == "warning" then
+        print(prefix .. " [WARNING] " .. message)
+    else
+        print(prefix .. " " .. message)
+    end
+end
+
+-- Check if source type is valid
+local function is_valid_source_type(source)
+    if not source then
+        return false
+    end
+    
+    local source_id = obs.obs_source_get_id(source)
+    for _, valid_type in ipairs(VALID_SOURCE_TYPES) do
+        if source_id == valid_type then
+            return true
+        end
+    end
+    return false
+end
+
+-- Find valid video source in current scene (recursive)
+local function find_valid_video_source()
+    local current_scene = obs.obs_frontend_get_current_scene()
+    if not current_scene then
+        log("info", "No current scene found")
+        return nil
+    end
+    
+    local scene = obs.obs_scene_from_source(current_scene)
+    local items = obs.obs_scene_enum_items(scene)
+    
+    local function check_source(source)
+        if not source then
+            return nil
+        end
+        
+        if is_valid_source_type(source) then
+            return source
+        elseif obs.obs_source_get_type(source) == obs.OBS_SOURCE_TYPE_SCENE then
+            -- Recursively search in nested scenes
+            local nested_scene = obs.obs_scene_from_source(source)
+            if nested_scene then
+                local nested_items = obs.obs_scene_enum_items(nested_scene)
+                for _, nested_item in ipairs(nested_items) do
+                    local nested_source = obs.obs_sceneitem_get_source(nested_item)
+                    local valid_source = check_source(nested_source)
+                    if valid_source then
+                        obs.sceneitem_list_release(nested_items)
+                        return valid_source
+                    end
+                end
+                obs.sceneitem_list_release(nested_items)
+            end
+        end
+        return nil
+    end
+    
+    local valid_source = nil
+    for _, item in ipairs(items) do
+        local item_source = obs.obs_sceneitem_get_source(item)
+        valid_source = check_source(item_source)
+        if valid_source then
+            break
+        end
+    end
+    
+    obs.sceneitem_list_release(items)
+    obs.obs_source_release(current_scene)
+    
+    if valid_source then
+        log("info", "Found valid video source: " .. obs.obs_source_get_name(valid_source))
+    else
+        log("info", "No valid video source found in the current scene")
+    end
+    
+    return valid_source
+end
+
+-- ============================================================================
+-- ANIMATION SYSTEM
+-- ============================================================================
+
+-- Easing functions
+local function ease_linear(t)
+    return t
+end
+
+local function ease_in_out(t)
+    return t * t * (3.0 - 2.0 * t)
+end
+
+local function ease_out(t)
+    return 1.0 - (1.0 - t) * (1.0 - t)
+end
+
+-- Generic animation function
+local function animate_value(start_value, target_value, duration, easing_func, callback)
+    local start_time = obs.os_gettime_ns() / 1000000 -- Convert to milliseconds
+    local easing = easing_func or ease_linear
+    
+    local function animate()
+        local current_time = obs.os_gettime_ns() / 1000000
+        local elapsed = current_time - start_time
+        local progress = math.min(elapsed / duration, 1.0)
+        
+        local eased_progress = easing(progress)
+        local current_value = start_value + (target_value - start_value) * eased_progress
+        
+        if callback then
+            callback(current_value, progress)
+        end
+        
+        if progress < 1.0 then
+            return true -- Continue animation
+        else
+            return false -- Animation complete
+        end
+    end
+    
+    return animate
+end
+
+-- ============================================================================
+-- CROP & FILTER MANAGEMENT
+-- ============================================================================
+
+-- Apply crop filter to target source
+local function apply_crop_filter(target_source)
+    if not target_source then
+        log("warning", "Cannot apply crop filter: target source is nil")
+        return
+    end
+    
+    local parent_source = obs.obs_frontend_get_current_scene()
+    local filter_target = obs.obs_source_get_type(target_source) == obs.OBS_SOURCE_TYPE_SCENE and parent_source or target_source
+    
+    -- Remove filter from previous source/scene if it exists
+    if app_state.current_filter_target and app_state.current_filter_target ~= filter_target then
+        local old_filter = obs.obs_source_get_filter_by_name(app_state.current_filter_target, CROP_FILTER_NAME)
+        if old_filter then
+            obs.obs_source_filter_remove(app_state.current_filter_target, old_filter)
+            obs.obs_source_release(old_filter)
+        end
+    end
+    
+    -- Apply filter only if it doesn't already exist
+    app_state.crop_filter = obs.obs_source_get_filter_by_name(filter_target, CROP_FILTER_NAME)
+    if not app_state.crop_filter then
+        app_state.crop_filter = obs.obs_source_create("crop_filter", CROP_FILTER_NAME, nil, nil)
+        obs.obs_source_filter_add(filter_target, app_state.crop_filter)
+        log("info", "Crop filter applied to " .. obs.obs_source_get_name(filter_target))
+    else
+        obs.obs_source_release(app_state.crop_filter)
+    end
+    
+    app_state.current_filter_target = filter_target
+    obs.obs_source_release(parent_source)
+end
+
+-- Update crop (keeping original implementation for OBS limitations)
+local function update_crop(left, top, right, bottom)
+    if app_state.crop_filter then
+        local settings = obs.obs_data_create()
+        obs.obs_data_set_int(settings, "left", math.floor(left + 0.5))
+        obs.obs_data_set_int(settings, "top", math.floor(top + 0.5))
+        obs.obs_data_set_int(settings, "right", math.floor(right + 0.5))
+        obs.obs_data_set_int(settings, "bottom", math.floor(bottom + 0.5))
+        obs.obs_source_update(app_state.crop_filter, settings)
+        obs.obs_data_release(settings)
+    end
+end
+
+-- Calculate target crop based on mouse position and zoom
+local function get_target_crop(mouse_x, mouse_y, current_zoom)
+    if not app_state.source then
+        return {left = 0, top = 0, right = 0, bottom = 0}
+    end
+    
+    local source_width = obs.obs_source_get_width(app_state.source)
+    local source_height = obs.obs_source_get_height(app_state.source)
+    
+    if source_width == 0 or source_height == 0 then
+        return {left = 0, top = 0, right = 0, bottom = 0}
+    end
+    
+    -- Find monitor where mouse is located
+    local current_monitor = app_state.monitors[1] or {left = 0, top = 0, right = DEFAULT_MONITOR_WIDTH, bottom = DEFAULT_MONITOR_HEIGHT}
+    for _, monitor in ipairs(app_state.monitors) do
+        if mouse_x >= monitor.left and mouse_x < monitor.right and
+           mouse_y >= monitor.top and mouse_y < monitor.bottom then
+            current_monitor = monitor
+            break
+        end
+    end
+    
+    local screen_width = current_monitor.right - current_monitor.left
+    local screen_height = current_monitor.bottom - current_monitor.top
+    
+    if screen_width == 0 or screen_height == 0 then
+        return {left = 0, top = 0, right = 0, bottom = 0}
+    end
+    
+    local scale_x = source_width / screen_width
+    local scale_y = source_height / screen_height
+    
+    local target_width = math.floor(source_width / current_zoom)
+    local target_height = math.floor(source_height / current_zoom)
+    
+    local target_x = math.floor((mouse_x - current_monitor.left) * scale_x - (target_width / 2))
+    local target_y = math.floor((mouse_y - current_monitor.top) * scale_y - (target_height / 2))
+    
+    target_x = math.max(0, math.min(target_x, source_width - target_width))
+    target_y = math.max(0, math.min(target_y, source_height - target_height))
+    
+    return {
+        left = target_x,
+        top = target_y,
+        right = source_width - (target_x + target_width),
+        bottom = source_height - (target_y + target_height)
+    end
+end
+
+-- ============================================================================
+-- ANIMATION HANDLERS
+-- ============================================================================
+
+-- Main zoom animation handler
+local function animate_zoom()
+    if not app_state.source or (not app_state.zoom.active and not app_state.follow.active) then
+        if app_state.animation_timer then
+            obs.timer_remove(animate_zoom)
+            app_state.animation_timer = nil
+        end
+        return
+    end
+    
+    local current_time = obs.os_gettime_ns() / 1000000 -- Convert to milliseconds
+    local elapsed_time = current_time - app_state.zoom.start_time
+    local progress = math.min(elapsed_time / ZOOM_ANIMATION_DURATION, 1.0)
+    
+    if app_state.zoom.active then
+        app_state.zoom.current = 1.0 + (app_state.zoom.target - 1.0) * progress * app_state.zoom.speed
+    end
+    
+    local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
+    local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
+    
+    if app_state.follow.active then
+        app_state.current_crop = app_state.current_crop or {left = 0, top = 0, right = 0, bottom = 0}
+        new_crop.left = app_state.current_crop.left + (new_crop.left - app_state.current_crop.left) * app_state.follow.speed
+        new_crop.top = app_state.current_crop.top + (new_crop.top - app_state.current_crop.top) * app_state.follow.speed
+        new_crop.right = app_state.current_crop.right + (new_crop.right - app_state.current_crop.right) * app_state.follow.speed
+        new_crop.bottom = app_state.current_crop.bottom + (new_crop.bottom - app_state.current_crop.bottom) * app_state.follow.speed
+    end
+    
+    update_crop(new_crop.left, new_crop.top, new_crop.right, new_crop.bottom)
+    app_state.current_crop = new_crop
+    
+    if progress >= 1.0 and not app_state.follow.active then
+        obs.timer_remove(animate_zoom)
+        app_state.animation_timer = nil
+    end
+end
+
+-- Smooth zoom out animation
+local function smooth_zoom_out()
+    local start_zoom = app_state.zoom.current
+    local start_time = obs.os_gettime_ns() / 1000000 -- Convert to milliseconds
+    
+    if app_state.animation_timer then
+        obs.timer_remove(animate_zoom)
+        app_state.animation_timer = nil
+    end
+    
+    -- Create timer for zoom out animation
+    local zoom_out_timer = nil
+    zoom_out_timer = obs.timer_add(function()
+        local current_time = obs.os_gettime_ns() / 1000000
+        local elapsed = current_time - start_time
+        local progress = math.min(elapsed / ZOOM_OUT_DURATION, 1.0)
+        
+        local eased_progress = ease_out(progress)
+        app_state.zoom.current = start_zoom + (1.0 - start_zoom) * eased_progress
+        
+        local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
+        local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
+        
+        if app_state.follow.active then
+            app_state.current_crop = app_state.current_crop or {left = 0, top = 0, right = 0, bottom = 0}
+            new_crop.left = app_state.current_crop.left + (new_crop.left - app_state.current_crop.left) * app_state.follow.speed
+            new_crop.top = app_state.current_crop.top + (new_crop.top - app_state.current_crop.top) * app_state.follow.speed
+            new_crop.right = app_state.current_crop.right + (new_crop.right - app_state.current_crop.right) * app_state.follow.speed
+            new_crop.bottom = app_state.current_crop.bottom + (new_crop.bottom - app_state.current_crop.bottom) * app_state.follow.speed
+        end
+        
+        update_crop(new_crop.left, new_crop.top, new_crop.right, new_crop.bottom)
+        app_state.current_crop = new_crop
+        
+        if progress >= 1.0 then
+            obs.timer_remove(zoom_out_timer)
+            app_state.zoom.active = false
+            if not app_state.follow.active then
+                if app_state.crop_filter and app_state.current_filter_target then
+                    obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
+                    app_state.crop_filter = nil
+                end
+                app_state.current_filter_target = nil
+            end
+        end
+    end, UPDATE_INTERVAL)
+end
+
+-- ============================================================================
+-- HOTKEY HANDLERS
+-- ============================================================================
+
+-- Handler for zoom hotkey
+local function on_zoom_hotkey(pressed)
+    if not pressed then
+        return
+    end
+    
+    if not app_state.source then
+        app_state.source = find_valid_video_source()
+        if not app_state.source then
+            log("warning", "No valid video source found in the current scene")
+            return
+        end
+    end
+    
+    if app_state.zoom.active then
+        app_state.zoom.active = false
+        app_state.follow.active = false -- Also deactivate follow when zoom is deactivated
+        smooth_zoom_out()
+    else
+        app_state.zoom.active = true
+        apply_crop_filter(app_state.source)
+        if not app_state.original_crop then
+            app_state.original_crop = {left = 0, top = 0, right = 0, bottom = 0}
+        end
+        app_state.zoom.target = app_state.zoom.value
+        app_state.zoom.start_time = obs.os_gettime_ns() / 1000000
+        
+        if not app_state.animation_timer then
+            app_state.animation_timer = obs.timer_add(animate_zoom, UPDATE_INTERVAL)
+        end
+    end
+    
+    log("info", "Zoom " .. (app_state.zoom.active and "activated" or "deactivating"))
+    if not app_state.zoom.active then
+        log("info", "Follow deactivated automatically")
+    end
+end
+
+-- Handler for follow hotkey
+local function on_follow_hotkey(pressed)
+    if not pressed then
+        return
+    end
+    
+    if not app_state.zoom.active then
+        log("warning", "Follow can only be activated when zoom is active")
+        return
+    end
+    
+    app_state.follow.active = not app_state.follow.active
+    if app_state.follow.active then
+        if not app_state.animation_timer then
+            app_state.animation_timer = obs.timer_add(animate_zoom, UPDATE_INTERVAL)
+        end
+    end
+    log("info", "Follow " .. (app_state.follow.active and "activated" or "deactivated"))
+end
+
+-- ============================================================================
+-- SCENE CHANGE HANDLER
+-- ============================================================================
+
+-- Handle scene changes
+local function on_scene_change()
+    local new_scene = obs.obs_frontend_get_current_scene()
+    if new_scene ~= app_state.current_scene then
+        app_state.current_scene = new_scene
+        
+        -- Remove filter from previous scene if it exists
+        if app_state.current_filter_target then
+            local old_filter = obs.obs_source_get_filter_by_name(app_state.current_filter_target, CROP_FILTER_NAME)
+            if old_filter then
+                obs.obs_source_filter_remove(app_state.current_filter_target, old_filter)
+                obs.obs_source_release(old_filter)
+            end
+        end
+        
+        -- Find new valid video source in the new scene
+        app_state.source = find_valid_video_source()
+        
+        if app_state.source then
+            -- Apply filter to the new source
+            apply_crop_filter(app_state.source)
+            
+            if app_state.zoom.active then
+                -- If zoom was active, gradually reapply zoom to the new scene
+                local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
+                local start_crop = {left = 0, top = 0, right = 0, bottom = 0}
+                local end_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
+                local start_time = obs.os_gettime_ns() / 1000000
+                
+                local transition_timer = nil
+                transition_timer = obs.timer_add(function()
+                    local current_time = obs.os_gettime_ns() / 1000000
+                    local progress = math.min((current_time - start_time) / SCENE_TRANSITION_DURATION, 1.0)
+                    
+                    local new_crop = {
+                        left = start_crop.left + (end_crop.left - start_crop.left) * progress,
+                        top = start_crop.top + (end_crop.top - start_crop.top) * progress,
+                        right = start_crop.right + (end_crop.right - start_crop.right) * progress,
+                        bottom = start_crop.bottom + (end_crop.bottom - start_crop.bottom) * progress
+                    }
+                    
+                    update_crop(new_crop.left, new_crop.top, new_crop.right, new_crop.bottom)
+                    
+                    if progress >= 1.0 then
+                        obs.timer_remove(transition_timer)
+                    end
+                end, UPDATE_INTERVAL)
+            else
+                -- If zoom wasn't active, ensure the filter is set without zoom
+                update_crop(0, 0, 0, 0)
+            end
+        else
+            -- If no valid source is found, deactivate zoom
+            app_state.zoom.active = false
+            app_state.follow.active = false
+            if app_state.animation_timer then
+                obs.timer_remove(animate_zoom)
+                app_state.animation_timer = nil
+            end
+            log("warning", "Zoom deactivated: no valid video source in the new scene")
+        end
+    end
+    obs.obs_source_release(new_scene)
+end
+
+-- ============================================================================
+-- SETTINGS VALIDATION
+-- ============================================================================
+
+-- Validate settings
+local function validate_settings(settings)
+    local zoom_val = obs.obs_data_get_double(settings, "zoom_value")
+    local zoom_spd = obs.obs_data_get_double(settings, "zoom_speed")
+    local follow_spd = obs.obs_data_get_double(settings, "follow_speed")
+    
+    -- Clamp values to valid ranges
+    if zoom_val < 1.1 or zoom_val > 5.0 then
+        log("warning", "Zoom value out of range, clamping to valid range")
+        obs.obs_data_set_double(settings, "zoom_value", math.max(1.1, math.min(5.0, zoom_val)))
+    end
+    
+    if zoom_spd < 0.01 or zoom_spd > 1.0 then
+        log("warning", "Zoom speed out of range, clamping to valid range")
+        obs.obs_data_set_double(settings, "zoom_speed", math.max(0.01, math.min(1.0, zoom_spd)))
+    end
+    
+    if follow_spd < 0.01 or follow_spd > 1.0 then
+        log("warning", "Follow speed out of range, clamping to valid range")
+        obs.obs_data_set_double(settings, "follow_speed", math.max(0.01, math.min(1.0, follow_spd)))
+    end
+end
+
+-- ============================================================================
+-- RESOURCE CLEANUP
+-- ============================================================================
+
+-- Cleanup all resources
+local function cleanup_all_resources()
+    -- Remove animation timer
+    if app_state.animation_timer then
+        obs.timer_remove(animate_zoom)
+        app_state.animation_timer = nil
+    end
+    
+    -- Remove crop filter
+    if app_state.crop_filter and app_state.current_filter_target then
+        pcall(function()
+            obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
+        end)
+        app_state.crop_filter = nil
+    end
+    
+    -- Release source reference
+    if app_state.source then
+        obs.obs_source_release(app_state.source)
+        app_state.source = nil
+    end
+    
+    -- Release scene reference
+    if app_state.current_scene then
+        obs.obs_source_release(app_state.current_scene)
+        app_state.current_scene = nil
+    end
+    
+    -- Cleanup FFI platform
+    ffi_platform.cleanup()
+    
+    -- Reset state
+    reset_state()
+end
+
+-- ============================================================================
+-- OBS CALLBACKS
+-- ============================================================================
+
+-- Script description
+function script_description()
+    return "Zoom and follow mouse for OBS Studio. Supports multi-monitor setups. Version 2.0.0 (Refactored 2025)"
+end
+
+-- Script properties
+function script_properties()
+    local props = obs.obs_properties_create()
+    obs.obs_properties_add_float_slider(props, "zoom_value", "Zoom Value", 1.1, 5.0, 0.1)
+    obs.obs_properties_add_float_slider(props, "zoom_speed", "Zoom Speed", 0.01, 1.0, 0.01)
+    obs.obs_properties_add_float_slider(props, "follow_speed", "Follow Speed", 0.01, 1.0, 0.01)
+    obs.obs_properties_add_bool(props, "debug_mode", "Enable Debug Mode")
+    return props
+end
+
+-- Default values
+function script_defaults(settings)
+    obs.obs_data_set_default_double(settings, "zoom_value", 2.0)
+    obs.obs_data_set_default_double(settings, "zoom_speed", 0.1)
+    obs.obs_data_set_default_double(settings, "follow_speed", 0.1)
+    obs.obs_data_set_default_bool(settings, "debug_mode", false)
+end
+
+-- Settings update
+function script_update(settings)
+    -- Validate settings first
+    validate_settings(settings)
+    
+    -- Update state with validated settings
+    app_state.zoom.value = obs.obs_data_get_double(settings, "zoom_value")
+    app_state.zoom.speed = obs.obs_data_get_double(settings, "zoom_speed")
+    app_state.follow.speed = obs.obs_data_get_double(settings, "follow_speed")
+    app_state.debug_mode = obs.obs_data_get_bool(settings, "debug_mode")
+    
+    if app_state.zoom.active then
+        app_state.zoom.target = app_state.zoom.value
+    end
+    
+    validate_state()
+end
+
+-- Script loading
+function script_load(settings)
+    -- Initialize FFI platform
+    local success, err = ffi_platform.init()
+    if not success then
+        log("error", "Failed to initialize FFI platform: " .. tostring(err))
+    end
+    
+    -- Get monitor information
+    app_state.monitors = ffi_platform.get_monitors()
+    log("info", "Detected " .. #app_state.monitors .. " monitor(s)")
+    
+    -- Register hotkeys
+    app_state.zoom_hotkey_id = obs.obs_hotkey_register_frontend(ZOOM_HOTKEY_NAME, "Toggle Zoom", on_zoom_hotkey)
+    app_state.follow_hotkey_id = obs.obs_hotkey_register_frontend(FOLLOW_HOTKEY_NAME, "Toggle Follow", on_follow_hotkey)
+    
+    -- Load saved hotkeys
+    local zoom_hotkey_save_array = obs.obs_data_get_array(settings, ZOOM_HOTKEY_NAME)
+    obs.obs_hotkey_load(app_state.zoom_hotkey_id, zoom_hotkey_save_array)
+    obs.obs_data_array_release(zoom_hotkey_save_array)
+    
+    local follow_hotkey_save_array = obs.obs_data_get_array(settings, FOLLOW_HOTKEY_NAME)
+    obs.obs_hotkey_load(app_state.follow_hotkey_id, follow_hotkey_save_array)
+    obs.obs_data_array_release(follow_hotkey_save_array)
+    
+    -- Add event handler for scene changes
+    obs.obs_frontend_add_event_callback(function(event)
+        if event == obs.OBS_FRONTEND_EVENT_SCENE_CHANGED then
+            on_scene_change()
+        end
+    end)
+    
+    -- Update settings
+    script_update(settings)
+    
+    -- Apply filter to current scene at startup
+    app_state.source = find_valid_video_source()
+    if app_state.source then
+        apply_crop_filter(app_state.source)
+    end
+end
+
+-- Script saving
+function script_save(settings)
+    local zoom_hotkey_save_array = obs.obs_hotkey_save(app_state.zoom_hotkey_id)
+    obs.obs_data_set_array(settings, ZOOM_HOTKEY_NAME, zoom_hotkey_save_array)
+    obs.obs_data_array_release(zoom_hotkey_save_array)
+    
+    local follow_hotkey_save_array = obs.obs_hotkey_save(app_state.follow_hotkey_id)
+    obs.obs_data_set_array(settings, FOLLOW_HOTKEY_NAME, follow_hotkey_save_array)
+    obs.obs_data_array_release(follow_hotkey_save_array)
+end
+
+-- Script unloading
+function script_unload()
+    cleanup_all_resources()
+end
+
