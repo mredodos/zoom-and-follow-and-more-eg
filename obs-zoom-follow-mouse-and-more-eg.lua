@@ -18,6 +18,8 @@ local MOUSE_CACHE_DURATION = 8 -- milliseconds (max 120 FPS)
 local ZOOM_ANIMATION_DURATION = 300 -- milliseconds
 local ZOOM_OUT_DURATION = 500 -- milliseconds
 local SCENE_TRANSITION_DURATION = 300 -- milliseconds
+local MOUSE_DEADZONE = 2 -- pixels: minimum mouse movement to trigger crop update (prevents flickering)
+local CROP_UPDATE_THRESHOLD = 1 -- pixels: minimum crop change to trigger update
 local DEFAULT_MONITOR_WIDTH = 1920
 local DEFAULT_MONITOR_HEIGHT = 1080
 local MAX_DISPLAYS = 32 -- Maximum displays for macOS
@@ -297,7 +299,7 @@ function ffi_platform.get_mouse_pos()
     local success = false
     
     if ffi_platform.os_type == "Windows" then
-        local success_pcall, result = pcall(function()
+        local success_pcall, x_result, y_result = pcall(function()
             local point = ffi.new("POINT[1]")
             if ffi.C.GetCursorPos(point) then
                 return point[0].x, point[0].y
@@ -305,13 +307,13 @@ function ffi_platform.get_mouse_pos()
             return 0, 0
         end)
         if success_pcall then
-            x, y = result
+            x, y = x_result, y_result
             success = true
         end
         
     elseif ffi_platform.os_type == "Linux" then
         if ffi_platform.x11_display ~= nil then
-            local success_pcall, result = pcall(function()
+            local success_pcall, x_result, y_result = pcall(function()
                 local root_x = ffi.new("int[1]")
                 local root_y = ffi.new("int[1]")
                 local win_x = ffi.new("int[1]")
@@ -327,14 +329,14 @@ function ffi_platform.get_mouse_pos()
                 return 0, 0
             end)
             if success_pcall then
-                x, y = result
+                x, y = x_result, y_result
                 success = true
             end
         end
         
     elseif ffi_platform.os_type == "OSX" then
         if ffi_platform.core_graphics ~= nil then
-            local success_pcall, result = pcall(function()
+            local success_pcall, x_result, y_result = pcall(function()
                 local event = ffi_platform.core_graphics.CGEventCreate(nil)
                 if event ~= nil then
                     local point = ffi_platform.core_graphics.CGEventGetLocation(event)
@@ -344,7 +346,7 @@ function ffi_platform.get_mouse_pos()
                 return 0, 0
             end)
             if success_pcall then
-                x, y = result
+                x, y = x_result, y_result
                 success = true
             end
         end
@@ -396,12 +398,17 @@ local app_state = {
     },
     source = nil,
     crop_filter = nil,
+    crop_filter_owned = false, -- Track if filter was created by us (needs release) or borrowed (no release)
     original_crop = nil,
     current_crop = nil,
     target_crop = nil,
+    last_mouse_pos = {x = 0, y = 0}, -- Track last mouse position for deadzone calculation
+    last_crop = {left = 0, top = 0, right = 0, bottom = 0}, -- Track last crop values to prevent unnecessary updates
     current_scene = nil,
     current_filter_target = nil,
     animation_timer = nil,
+    zoom_out_timer = nil,
+    zoom_out_in_progress = false,
     monitors = {},
     zoom_hotkey_id = nil,
     follow_hotkey_id = nil,
@@ -517,6 +524,7 @@ local function find_valid_video_source()
     obs.obs_source_release(current_scene)
     
     if valid_source then
+        -- Note: Sources from scene items are managed by OBS, no need to addref/release
         log("info", "Found valid video source: " .. obs.obs_source_get_name(valid_source))
     else
         log("info", "No valid video source found in the current scene")
@@ -581,25 +589,51 @@ local function apply_crop_filter(target_source)
     end
     
     local parent_source = obs.obs_frontend_get_current_scene()
+    if not parent_source then
+        log("warning", "Cannot get current scene")
+        return
+    end
+    
     local filter_target = obs.obs_source_get_type(target_source) == obs.OBS_SOURCE_TYPE_SCENE and parent_source or target_source
     
     -- Remove filter from previous source/scene if it exists
     if app_state.current_filter_target and app_state.current_filter_target ~= filter_target then
         local old_filter = obs.obs_source_get_filter_by_name(app_state.current_filter_target, CROP_FILTER_NAME)
         if old_filter then
-            obs.obs_source_filter_remove(app_state.current_filter_target, old_filter)
-            obs.obs_source_release(old_filter)
+            -- Note: obs_source_get_filter_by_name returns borrowed reference, no need to release
+            pcall(function()
+                obs.obs_source_filter_remove(app_state.current_filter_target, old_filter)
+            end)
         end
     end
     
-    -- Apply filter only if it doesn't already exist
-    app_state.crop_filter = obs.obs_source_get_filter_by_name(filter_target, CROP_FILTER_NAME)
-    if not app_state.crop_filter then
-        app_state.crop_filter = obs.obs_source_create("crop_filter", CROP_FILTER_NAME, nil, nil)
-        obs.obs_source_filter_add(filter_target, app_state.crop_filter)
-        log("info", "Crop filter applied to " .. obs.obs_source_get_name(filter_target))
-    else
+    -- Release old filter reference if it was created by us (not a borrowed reference)
+    if app_state.crop_filter and app_state.crop_filter_owned then
+        -- Only release if we created it
         obs.obs_source_release(app_state.crop_filter)
+        app_state.crop_filter = nil
+        app_state.crop_filter_owned = false
+    end
+    
+    -- Always create a new filter to ensure clean state
+    -- Remove any existing filter first
+    local existing_filter = obs.obs_source_get_filter_by_name(filter_target, CROP_FILTER_NAME)
+    if existing_filter then
+        -- Remove existing filter first
+        pcall(function()
+            obs.obs_source_filter_remove(filter_target, existing_filter)
+        end)
+        log("info", "Removed existing crop filter before creating new one")
+    end
+    
+    -- Create new filter (must be released when done)
+    app_state.crop_filter = obs.obs_source_create("crop_filter", CROP_FILTER_NAME, nil, nil)
+    if app_state.crop_filter then
+        obs.obs_source_filter_add(filter_target, app_state.crop_filter)
+        app_state.crop_filter_owned = true
+        log("info", "Crop filter created and applied to " .. obs.obs_source_get_name(filter_target))
+    else
+        log("error", "Failed to create crop filter")
     end
     
     app_state.current_filter_target = filter_target
@@ -608,15 +642,36 @@ end
 
 -- Update crop (keeping original implementation for OBS limitations)
 local function update_crop(left, top, right, bottom)
-    if app_state.crop_filter then
-        local settings = obs.obs_data_create()
-        obs.obs_data_set_int(settings, "left", math.floor(left + 0.5))
-        obs.obs_data_set_int(settings, "top", math.floor(top + 0.5))
-        obs.obs_data_set_int(settings, "right", math.floor(right + 0.5))
-        obs.obs_data_set_int(settings, "bottom", math.floor(bottom + 0.5))
-        obs.obs_source_update(app_state.crop_filter, settings)
-        obs.obs_data_release(settings)
+    if not app_state.crop_filter then
+        return
     end
+    
+    -- Validate filter is still valid
+    local filter_valid = pcall(function()
+        obs.obs_source_get_name(app_state.crop_filter)
+    end)
+    
+    if not filter_valid then
+        log("warning", "Crop filter became invalid")
+        app_state.crop_filter = nil
+        return
+    end
+    
+    local settings = obs.obs_data_create()
+    obs.obs_data_set_int(settings, "left", math.floor(left + 0.5))
+    obs.obs_data_set_int(settings, "top", math.floor(top + 0.5))
+    obs.obs_data_set_int(settings, "right", math.floor(right + 0.5))
+    obs.obs_data_set_int(settings, "bottom", math.floor(bottom + 0.5))
+    
+    local update_success = pcall(function()
+        obs.obs_source_update(app_state.crop_filter, settings)
+    end)
+    
+    if not update_success then
+        log("warning", "Failed to update crop filter")
+    end
+    
+    obs.obs_data_release(settings)
 end
 
 -- Calculate target crop based on mouse position and zoom
@@ -625,8 +680,25 @@ local function get_target_crop(mouse_x, mouse_y, current_zoom)
         return {left = 0, top = 0, right = 0, bottom = 0}
     end
     
-    local source_width = obs.obs_source_get_width(app_state.source)
-    local source_height = obs.obs_source_get_height(app_state.source)
+    -- Validate source is still valid
+    local source_width, source_height
+    local success, width_result, height_result = pcall(function()
+        return obs.obs_source_get_width(app_state.source), obs.obs_source_get_height(app_state.source)
+    end)
+    
+    if not success or not width_result or not height_result then
+        log("warning", "Source is invalid, resetting")
+        -- Note: Sources from scene items are managed by OBS, no need to release
+        app_state.source = nil
+        return {left = 0, top = 0, right = 0, bottom = 0}
+    end
+    
+    source_width = width_result
+    source_height = height_result
+    
+    if source_width == 0 or source_height == 0 then
+        return {left = 0, top = 0, right = 0, bottom = 0}
+    end
     
     if source_width == 0 or source_height == 0 then
         return {left = 0, top = 0, right = 0, bottom = 0}
@@ -666,7 +738,7 @@ local function get_target_crop(mouse_x, mouse_y, current_zoom)
         top = target_y,
         right = source_width - (target_x + target_width),
         bottom = source_height - (target_y + target_height)
-    end
+    }
 end
 
 -- ============================================================================
@@ -675,7 +747,34 @@ end
 
 -- Main zoom animation handler
 local function animate_zoom()
-    if not app_state.source or (not app_state.zoom.active and not app_state.follow.active) then
+    -- Validate source before using it
+    if not app_state.source then
+        if app_state.animation_timer then
+            obs.timer_remove(animate_zoom)
+            app_state.animation_timer = nil
+        end
+        return
+    end
+    
+    -- Check if source is still valid
+    local source_valid = pcall(function()
+        obs.obs_source_get_width(app_state.source)
+    end)
+    
+    if not source_valid then
+        log("warning", "Source became invalid, stopping animation")
+        app_state.zoom.active = false
+        app_state.follow.active = false
+        if app_state.animation_timer then
+            obs.timer_remove(animate_zoom)
+            app_state.animation_timer = nil
+        end
+        -- Note: Sources from scene items are managed by OBS, no need to release
+        app_state.source = nil
+        return
+    end
+    
+    if not app_state.zoom.active and not app_state.follow.active then
         if app_state.animation_timer then
             obs.timer_remove(animate_zoom)
             app_state.animation_timer = nil
@@ -688,10 +787,34 @@ local function animate_zoom()
     local progress = math.min(elapsed_time / ZOOM_ANIMATION_DURATION, 1.0)
     
     if app_state.zoom.active then
+        local old_zoom = app_state.zoom.current
         app_state.zoom.current = 1.0 + (app_state.zoom.target - 1.0) * progress * app_state.zoom.speed
+        if app_state.debug_mode and math.abs(old_zoom - app_state.zoom.current) > 0.01 then
+            log("info", string.format("Zoom progress: %.2f%%, current zoom: %.2f", progress * 100, app_state.zoom.current))
+        end
     end
     
     local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
+    
+    -- Calculate mouse movement distance
+    local mouse_delta_x = math.abs(mouse_x - app_state.last_mouse_pos.x)
+    local mouse_delta_y = math.abs(mouse_y - app_state.last_mouse_pos.y)
+    local mouse_distance = math.sqrt(mouse_delta_x * mouse_delta_x + mouse_delta_y * mouse_delta_y)
+    
+    if app_state.debug_mode then
+        log("info", string.format("Mouse pos: (%d, %d), delta: (%.1f, %.1f), distance: %.1f", 
+            mouse_x, mouse_y, mouse_delta_x, mouse_delta_y, mouse_distance))
+    end
+    
+    -- Only update crop if mouse moved beyond deadzone (prevents flickering when mouse is stationary)
+    local should_update = true
+    if app_state.follow.active and mouse_distance < MOUSE_DEADZONE then
+        should_update = false
+        if app_state.debug_mode then
+            log("info", string.format("Mouse movement below deadzone (%.1f < %d), skipping crop update", mouse_distance, MOUSE_DEADZONE))
+        end
+    end
+    
     local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
     
     if app_state.follow.active then
@@ -700,10 +823,43 @@ local function animate_zoom()
         new_crop.top = app_state.current_crop.top + (new_crop.top - app_state.current_crop.top) * app_state.follow.speed
         new_crop.right = app_state.current_crop.right + (new_crop.right - app_state.current_crop.right) * app_state.follow.speed
         new_crop.bottom = app_state.current_crop.bottom + (new_crop.bottom - app_state.current_crop.bottom) * app_state.follow.speed
+        
+        if app_state.debug_mode then
+            log("info", string.format("Follow active - crop: L:%d T:%d R:%d B:%d, speed: %.2f", 
+                new_crop.left, new_crop.top, new_crop.right, new_crop.bottom, app_state.follow.speed))
+        end
     end
     
-    update_crop(new_crop.left, new_crop.top, new_crop.right, new_crop.bottom)
+    -- Only update crop if there's a significant change (prevents unnecessary updates)
+    if should_update then
+        local crop_delta_left = math.abs(new_crop.left - app_state.last_crop.left)
+        local crop_delta_top = math.abs(new_crop.top - app_state.last_crop.top)
+        local crop_delta_right = math.abs(new_crop.right - app_state.last_crop.right)
+        local crop_delta_bottom = math.abs(new_crop.bottom - app_state.last_crop.bottom)
+        
+        local max_crop_delta = math.max(crop_delta_left, crop_delta_top, crop_delta_right, crop_delta_bottom)
+        
+        if max_crop_delta >= CROP_UPDATE_THRESHOLD then
+            update_crop(new_crop.left, new_crop.top, new_crop.right, new_crop.bottom)
+            app_state.last_crop = {
+                left = new_crop.left,
+                top = new_crop.top,
+                right = new_crop.right,
+                bottom = new_crop.bottom
+            }
+            
+            if app_state.debug_mode then
+                log("info", string.format("Crop updated - delta: L:%d T:%d R:%d B:%d", 
+                    crop_delta_left, crop_delta_top, crop_delta_right, crop_delta_bottom))
+            end
+        elseif app_state.debug_mode then
+            log("info", string.format("Crop change below threshold (max delta: %d < %d), skipping update", 
+                max_crop_delta, CROP_UPDATE_THRESHOLD))
+        end
+    end
+    
     app_state.current_crop = new_crop
+    app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
     
     if progress >= 1.0 and not app_state.follow.active then
         obs.timer_remove(animate_zoom)
@@ -713,17 +869,36 @@ end
 
 -- Smooth zoom out animation
 local function smooth_zoom_out()
+    -- Prevent multiple zoom out animations
+    if app_state.zoom_out_in_progress then
+        log("warning", "Zoom out already in progress, skipping")
+        return
+    end
+    
     local start_zoom = app_state.zoom.current
     local start_time = obs.os_gettime_ns() / 1000000 -- Convert to milliseconds
     
+    -- Stop any existing timers
     if app_state.animation_timer then
         obs.timer_remove(animate_zoom)
         app_state.animation_timer = nil
     end
     
+    if app_state.zoom_out_timer then
+        obs.timer_remove(app_state.zoom_out_timer)
+        app_state.zoom_out_timer = nil
+    end
+    
+    app_state.zoom_out_in_progress = true
+    
     -- Create timer for zoom out animation
-    local zoom_out_timer = nil
-    zoom_out_timer = obs.timer_add(function()
+    local zoom_out_completed = false
+    app_state.zoom_out_timer = obs.timer_add(function()
+        -- Prevent multiple executions after completion
+        if zoom_out_completed then
+            return
+        end
+        
         local current_time = obs.os_gettime_ns() / 1000000
         local elapsed = current_time - start_time
         local progress = math.min(elapsed / ZOOM_OUT_DURATION, 1.0)
@@ -731,7 +906,23 @@ local function smooth_zoom_out()
         local eased_progress = ease_out(progress)
         app_state.zoom.current = start_zoom + (1.0 - start_zoom) * eased_progress
         
+        if app_state.debug_mode then
+            log("info", string.format("Zoom out progress: %.2f%%, current zoom: %.2f", progress * 100, app_state.zoom.current))
+        end
+        
         local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
+        
+        -- Calculate mouse movement distance
+        local mouse_delta_x = math.abs(mouse_x - app_state.last_mouse_pos.x)
+        local mouse_delta_y = math.abs(mouse_y - app_state.last_mouse_pos.y)
+        local mouse_distance = math.sqrt(mouse_delta_x * mouse_delta_x + mouse_delta_y * mouse_delta_y)
+        
+        -- Only update crop if mouse moved beyond deadzone (prevents flickering when mouse is stationary)
+        local should_update = true
+        if app_state.follow.active and mouse_distance < MOUSE_DEADZONE then
+            should_update = false
+        end
+        
         local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
         
         if app_state.follow.active then
@@ -742,19 +933,61 @@ local function smooth_zoom_out()
             new_crop.bottom = app_state.current_crop.bottom + (new_crop.bottom - app_state.current_crop.bottom) * app_state.follow.speed
         end
         
-        update_crop(new_crop.left, new_crop.top, new_crop.right, new_crop.bottom)
+        -- Only update crop if there's a significant change
+        if should_update then
+            local crop_delta_left = math.abs(new_crop.left - app_state.last_crop.left)
+            local crop_delta_top = math.abs(new_crop.top - app_state.last_crop.top)
+            local crop_delta_right = math.abs(new_crop.right - app_state.last_crop.right)
+            local crop_delta_bottom = math.abs(new_crop.bottom - app_state.last_crop.bottom)
+            
+            local max_crop_delta = math.max(crop_delta_left, crop_delta_top, crop_delta_right, crop_delta_bottom)
+            
+            if max_crop_delta >= CROP_UPDATE_THRESHOLD then
+                update_crop(new_crop.left, new_crop.top, new_crop.right, new_crop.bottom)
+                app_state.last_crop = {
+                    left = new_crop.left,
+                    top = new_crop.top,
+                    right = new_crop.right,
+                    bottom = new_crop.bottom
+                }
+            end
+        end
+        
         app_state.current_crop = new_crop
+        app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
         
         if progress >= 1.0 then
-            obs.timer_remove(zoom_out_timer)
-            app_state.zoom.active = false
-            if not app_state.follow.active then
-                if app_state.crop_filter and app_state.current_filter_target then
-                    obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
-                    app_state.crop_filter = nil
-                end
-                app_state.current_filter_target = nil
+            zoom_out_completed = true
+            
+            -- Remove timer first
+            if app_state.zoom_out_timer then
+                obs.timer_remove(app_state.zoom_out_timer)
+                app_state.zoom_out_timer = nil
             end
+            
+            app_state.zoom_out_in_progress = false
+            app_state.zoom.active = false
+            app_state.zoom.current = 1.0 -- Reset zoom to default
+            app_state.current_crop = nil
+            
+            log("info", "Zoom out animation completed")
+            
+            -- Always remove filter when zoom is deactivated
+            if app_state.crop_filter and app_state.current_filter_target then
+                pcall(function()
+                    obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
+                end)
+                -- Release filter only if we created it
+                if app_state.crop_filter_owned then
+                    obs.obs_source_release(app_state.crop_filter)
+                end
+                app_state.crop_filter = nil
+                app_state.crop_filter_owned = false
+                app_state.current_filter_target = nil
+                log("info", "Filter removed after zoom out")
+            end
+            
+            return -- Exit immediately after completion
         end
     end, UPDATE_INTERVAL)
 end
@@ -769,20 +1002,71 @@ local function on_zoom_hotkey(pressed)
         return
     end
     
+    -- Validate or find source
     if not app_state.source then
         app_state.source = find_valid_video_source()
         if not app_state.source then
             log("warning", "No valid video source found in the current scene")
             return
         end
+    else
+        -- Verify source is still valid
+        local source_valid = pcall(function()
+            obs.obs_source_get_width(app_state.source)
+        end)
+        if not source_valid then
+            log("warning", "Source became invalid, searching for new one")
+            -- Note: Sources from scene items are managed by OBS, no need to release
+            app_state.source = nil
+            app_state.source = find_valid_video_source()
+            if not app_state.source then
+                log("warning", "No valid video source found in the current scene")
+                return
+            end
+        end
     end
     
     if app_state.zoom.active then
+        -- Deactivate zoom
+        log("info", "Deactivating zoom")
         app_state.zoom.active = false
         app_state.follow.active = false -- Also deactivate follow when zoom is deactivated
         smooth_zoom_out()
     else
+        -- Stop any existing animation before starting new one
+        log("info", "Activating zoom")
+        if app_state.animation_timer then
+            obs.timer_remove(animate_zoom)
+            app_state.animation_timer = nil
+        end
+        
+        if app_state.zoom_out_timer then
+            obs.timer_remove(app_state.zoom_out_timer)
+            app_state.zoom_out_timer = nil
+        end
+        
+        -- Reset zoom out flag if it was in progress
+        app_state.zoom_out_in_progress = false
+        
+        -- Ensure filter is cleaned up before reactivating
+        if app_state.crop_filter and app_state.current_filter_target then
+            pcall(function()
+                obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
+            end)
+            if app_state.crop_filter_owned then
+                obs.obs_source_release(app_state.crop_filter)
+            end
+            app_state.crop_filter = nil
+            app_state.crop_filter_owned = false
+            app_state.current_filter_target = nil
+        end
+        
+        -- Reset zoom state completely
+        app_state.zoom.current = 1.0
         app_state.zoom.active = true
+        app_state.current_crop = nil
+        
+        -- Reapply filter
         apply_crop_filter(app_state.source)
         if not app_state.original_crop then
             app_state.original_crop = {left = 0, top = 0, right = 0, bottom = 0}
@@ -790,9 +1074,8 @@ local function on_zoom_hotkey(pressed)
         app_state.zoom.target = app_state.zoom.value
         app_state.zoom.start_time = obs.os_gettime_ns() / 1000000
         
-        if not app_state.animation_timer then
-            app_state.animation_timer = obs.timer_add(animate_zoom, UPDATE_INTERVAL)
-        end
+        app_state.animation_timer = obs.timer_add(animate_zoom, UPDATE_INTERVAL)
+        log("info", "Zoom activated, timer started")
     end
     
     log("info", "Zoom " .. (app_state.zoom.active and "activated" or "deactivating"))
@@ -816,6 +1099,17 @@ local function on_follow_hotkey(pressed)
     if app_state.follow.active then
         if not app_state.animation_timer then
             app_state.animation_timer = obs.timer_add(animate_zoom, UPDATE_INTERVAL)
+            if app_state.debug_mode then
+                log("info", "Animation timer started for follow mode")
+            end
+        end
+        if app_state.debug_mode then
+            log("info", string.format("Follow activated - speed: %.2f, deadzone: %d pixels", 
+                app_state.follow.speed, MOUSE_DEADZONE))
+        end
+    else
+        if app_state.debug_mode then
+            log("info", "Follow deactivated")
         end
     end
     log("info", "Follow " .. (app_state.follow.active and "activated" or "deactivated"))
@@ -835,9 +1129,22 @@ local function on_scene_change()
         if app_state.current_filter_target then
             local old_filter = obs.obs_source_get_filter_by_name(app_state.current_filter_target, CROP_FILTER_NAME)
             if old_filter then
-                obs.obs_source_filter_remove(app_state.current_filter_target, old_filter)
-                obs.obs_source_release(old_filter)
+                -- Note: obs_source_get_filter_by_name returns borrowed reference, no need to release
+                pcall(function()
+                    obs.obs_source_filter_remove(app_state.current_filter_target, old_filter)
+                end)
             end
+        end
+        
+        -- Note: Sources from scene items are managed by OBS, no need to release
+        app_state.source = nil
+        
+        -- Release old filter reference only if we created it
+        -- Filters obtained with obs_source_get_filter_by_name are borrowed and shouldn't be released
+        if app_state.crop_filter and app_state.crop_filter_owned then
+            obs.obs_source_release(app_state.crop_filter)
+            app_state.crop_filter = nil
+            app_state.crop_filter_owned = false
         end
         
         -- Find new valid video source in the new scene
@@ -929,19 +1236,27 @@ local function cleanup_all_resources()
         app_state.animation_timer = nil
     end
     
+    -- Remove zoom out timer
+    if app_state.zoom_out_timer then
+        obs.timer_remove(app_state.zoom_out_timer)
+        app_state.zoom_out_timer = nil
+    end
+    
     -- Remove crop filter
     if app_state.crop_filter and app_state.current_filter_target then
         pcall(function()
             obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
         end)
+        -- Release filter only if we created it
+        if app_state.crop_filter_owned then
+            obs.obs_source_release(app_state.crop_filter)
+        end
         app_state.crop_filter = nil
+        app_state.crop_filter_owned = false
     end
     
-    -- Release source reference
-    if app_state.source then
-        obs.obs_source_release(app_state.source)
-        app_state.source = nil
-    end
+    -- Note: Sources from scene items are managed by OBS, no need to release
+    app_state.source = nil
     
     -- Release scene reference
     if app_state.current_scene then
