@@ -538,7 +538,10 @@ local function find_valid_video_source()
     end
     
     obs.sceneitem_list_release(items)
-    obs.obs_source_release(current_scene)
+    -- Release scene (protected with pcall)
+    pcall(function()
+        obs.obs_source_release(current_scene)
+    end)
     
     if valid_source then
         -- Note: Sources from scene items are managed by OBS, no need to addref/release
@@ -658,8 +661,10 @@ local function apply_crop_filter(target_source)
     
     -- Release old filter reference if it was created by us (not a borrowed reference)
     if app_state.crop_filter and app_state.crop_filter_owned then
-        -- Only release if we created it
-        obs.obs_source_release(app_state.crop_filter)
+        -- Only release if we created it (protected with pcall)
+        pcall(function()
+            obs.obs_source_release(app_state.crop_filter)
+        end)
         app_state.crop_filter = nil
         app_state.crop_filter_owned = false
     end
@@ -686,7 +691,10 @@ local function apply_crop_filter(target_source)
     end
     
     app_state.current_filter_target = filter_target
-    obs.obs_source_release(parent_source)
+    -- Release parent source (protected with pcall)
+    pcall(function()
+        obs.obs_source_release(parent_source)
+    end)
     
     -- Always log filter application details for debugging
     local filter_target_name = obs.obs_source_get_name(filter_target) or "unknown"
@@ -1045,9 +1053,12 @@ local function animate_zoom()
     app_state.current_crop = new_crop
     app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
     
-    if progress >= 1.0 and not app_state.follow.active then
+    -- Only remove timer if zoom animation is complete AND follow is not active
+    -- If follow is active, keep the timer running
+    if progress >= 1.0 and not app_state.follow.active and not app_state.zoom.active then
         obs.timer_remove(animate_zoom)
         app_state.animation_timer = nil
+        log("info", "Animation timer removed - zoom complete and follow inactive")
     end
 end
 
@@ -1170,9 +1181,11 @@ local function smooth_zoom_out()
                 pcall(function()
                     obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
                 end)
-                -- Release filter only if we created it
+                -- Release filter only if we created it (protected with pcall)
                 if app_state.crop_filter_owned then
-                    obs.obs_source_release(app_state.crop_filter)
+                    pcall(function()
+                        obs.obs_source_release(app_state.crop_filter)
+                    end)
                     log("info", "Crop filter released")
                 end
                 app_state.crop_filter = nil
@@ -1274,7 +1287,9 @@ local function on_zoom_hotkey(pressed)
                 obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
             end)
             if app_state.crop_filter_owned then
-                obs.obs_source_release(app_state.crop_filter)
+                pcall(function()
+                    obs.obs_source_release(app_state.crop_filter)
+                end)
             end
             app_state.crop_filter = nil
             app_state.crop_filter_owned = false
@@ -1334,12 +1349,20 @@ local function on_follow_hotkey(pressed)
     
     app_state.follow.active = not app_state.follow.active
     if app_state.follow.active then
+        -- Always ensure timer is running when follow is activated
         if not app_state.animation_timer then
             app_state.animation_timer = obs.timer_add(animate_zoom, app_state.update_interval)
+            log("info", "Animation timer started for follow mode")
         end
         log("info", string.format("Follow activated - speed: %.2f", app_state.follow.speed))
     else
         log("info", "Follow deactivated")
+        -- Only remove timer if zoom is also inactive
+        if not app_state.zoom.active and app_state.animation_timer then
+            obs.timer_remove(animate_zoom)
+            app_state.animation_timer = nil
+            log("info", "Animation timer removed - both zoom and follow inactive")
+        end
     end
 end
 
@@ -1370,7 +1393,9 @@ local function on_scene_change()
         -- Release old filter reference only if we created it
         -- Filters obtained with obs_source_get_filter_by_name are borrowed and shouldn't be released
         if app_state.crop_filter and app_state.crop_filter_owned then
-            obs.obs_source_release(app_state.crop_filter)
+            pcall(function()
+                obs.obs_source_release(app_state.crop_filter)
+            end)
             app_state.crop_filter = nil
             app_state.crop_filter_owned = false
         end
@@ -1432,7 +1457,10 @@ local function on_scene_change()
             log("warning", "Zoom deactivated: no valid video source in the new scene")
         end
     end
-    obs.obs_source_release(new_scene)
+    -- Release scene (protected with pcall)
+    pcall(function()
+        obs.obs_source_release(new_scene)
+    end)
 end
 
 -- ============================================================================
@@ -1487,25 +1515,30 @@ local function cleanup_all_resources()
         end
     end
     
-    -- Remove crop filter
+    -- Remove crop filter (protected with pcall to prevent crashes)
     if app_state.crop_filter and app_state.current_filter_target then
         pcall(function()
             obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
         end)
-        -- Release filter only if we created it
+        -- Release filter only if we created it (protected with pcall)
         if app_state.crop_filter_owned then
-            obs.obs_source_release(app_state.crop_filter)
+            pcall(function()
+                obs.obs_source_release(app_state.crop_filter)
+            end)
         end
         app_state.crop_filter = nil
         app_state.crop_filter_owned = false
+        app_state.current_filter_target = nil
     end
     
     -- Note: Sources from scene items are managed by OBS, no need to release
     app_state.source = nil
     
-    -- Release scene reference
+    -- Release scene reference (protected with pcall to prevent crashes)
     if app_state.current_scene then
-        obs.obs_source_release(app_state.current_scene)
+        pcall(function()
+            obs.obs_source_release(app_state.current_scene)
+        end)
         app_state.current_scene = nil
     end
     
