@@ -995,14 +995,7 @@ local function animate_zoom()
         return
     end
     
-    if not app_state.zoom.active and not app_state.follow.active then
-        if app_state.animation_timer then
-            obs.timer_remove(animate_zoom)
-            app_state.animation_timer = nil
-        end
-        return
-    end
-    
+    -- Handle zoom animation
     local current_time = obs.os_gettime_ns() / 1000000 -- Convert to milliseconds
     local elapsed_time = current_time - app_state.zoom.start_time
     local progress = math.min(elapsed_time / app_state.zoom_animation_duration, 1.0)
@@ -1011,6 +1004,27 @@ local function animate_zoom()
         app_state.zoom.current = 1.0 + (app_state.zoom.target - 1.0) * progress * app_state.zoom.speed
     end
     
+    -- If follow is not active, only update crop during zoom animation, then stop timer
+    if not app_state.follow.active then
+        -- During zoom animation, center crop on mouse
+        if app_state.zoom.active and progress < 1.0 then
+            local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
+            local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
+            update_crop_if_needed(new_crop, true)
+            app_state.current_crop = new_crop
+            app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
+        elseif progress >= 1.0 then
+            -- Zoom animation complete: crop stays fixed, stop timer
+            if app_state.animation_timer then
+                obs.timer_remove(animate_zoom)
+                app_state.animation_timer = nil
+                log("info", "Animation timer removed - zoom complete, follow inactive")
+            end
+        end
+        return
+    end
+    
+    -- Follow is active: crop follows mouse with interpolation
     local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
     
     -- Calculate mouse movement distance
@@ -1020,26 +1034,10 @@ local function animate_zoom()
     
     -- Only update crop if mouse moved beyond deadzone (prevents flickering when mouse is stationary)
     local should_update = true
-    if app_state.follow.active and mouse_distance < app_state.mouse_deadzone then
+    if mouse_distance < app_state.mouse_deadzone then
         should_update = false
-        -- Update last_mouse_pos even when skipping update to prevent deadzone accumulation
         app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
         return -- Exit early to avoid unnecessary calculations
-    end
-    
-    -- Debug: Log state before get_target_crop (only first few times)
-    if app_state.debug_mode and (not app_state._crop_calc_count or app_state._crop_calc_count < 3) then
-        app_state._crop_calc_count = (app_state._crop_calc_count or 0) + 1
-        local ft_name = "nil"
-        local s_name = "nil"
-        if app_state.current_filter_target then
-            pcall(function() ft_name = obs.obs_source_get_name(app_state.current_filter_target) or "unknown" end)
-        end
-        if app_state.source then
-            pcall(function() s_name = obs.obs_source_get_name(app_state.source) or "unknown" end)
-        end
-        log("info", string.format("get_target_crop called (call #%d) - filter_target: %s, source: %s", 
-            app_state._crop_calc_count, ft_name, s_name))
     end
     
     local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
@@ -1052,14 +1050,6 @@ local function animate_zoom()
     
     app_state.current_crop = new_crop
     app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
-    
-    -- Only remove timer if zoom animation is complete AND follow is not active
-    -- If follow is active, keep the timer running
-    if progress >= 1.0 and not app_state.follow.active and not app_state.zoom.active then
-        obs.timer_remove(animate_zoom)
-        app_state.animation_timer = nil
-        log("info", "Animation timer removed - zoom complete and follow inactive")
-    end
 end
 
 -- Smooth zoom out animation
@@ -1307,6 +1297,7 @@ local function on_zoom_hotkey(pressed)
         -- Reset zoom state completely
         app_state.zoom.current = 1.0
         app_state.zoom.active = true
+        app_state.follow.active = false  -- Reset follow state when zoom is activated
         app_state.current_crop = nil
         app_state.last_mouse_pos = {x = 0, y = 0}
         app_state.last_crop = {left = 0, top = 0, right = 0, bottom = 0}
