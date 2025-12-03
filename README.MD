@@ -8,6 +8,19 @@ This third-party script for OBS Studio creates a dynamic zoom effect and follows
 
 **Version 2.0.0 (Refactored 2025)** - Completely rewritten with modern best practices, improved performance, and extensive configurability.
 
+## Testing Help Needed
+
+We are looking for volunteers to help test this script on **Linux** and **macOS** platforms. While the script is designed to be cross-platform, we need community feedback to ensure it works correctly across all operating systems.
+
+If you're using Linux or macOS and would like to help:
+
+- Test the script with various OBS Studio versions
+- Report any platform-specific issues or bugs
+- Provide feedback on functionality and performance
+- Share your system specifications and OBS Studio version
+
+Please open an issue on GitHub or contact the script's author if you're interested in helping with testing.
+
 ## Features
 
 - Dynamic zoom on any valid video source
