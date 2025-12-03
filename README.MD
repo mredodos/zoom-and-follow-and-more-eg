@@ -163,6 +163,7 @@ The script includes an "Advanced Settings" group with fine-tuning options:
 - Automatic scene switching management and source removal
 - Multi-monitor configuration support
 - Smooth transitions during scene changes while in zoom mode
+- Debug mode for easier troubleshooting
 
 ## Troubleshooting
 
