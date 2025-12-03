@@ -1,4 +1,4 @@
-# Zoom and Follow Mouse EG
+# Zoom and Follow Mouse and More - By Edoardo Guzzi
 
 > **Note**: This is a third-party script for OBS Studio. It is not developed, maintained, or endorsed by the OBS Project. This script is provided as-is by the community.
 
