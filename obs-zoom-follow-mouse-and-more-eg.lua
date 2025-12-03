@@ -1842,4 +1842,3 @@ function script_unload()
         reset_state()
     end
 end
-
