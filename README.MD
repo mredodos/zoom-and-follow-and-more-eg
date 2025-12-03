@@ -1,8 +1,10 @@
-# OBS - Zoom and Follow Mouse EG
+# Zoom and Follow Mouse EG
+
+> **Note**: This is a third-party script for OBS Studio. It is not developed, maintained, or endorsed by the OBS Project. This script is provided as-is by the community.
 
 ## Description
 
-This script for OBS Studio creates a dynamic zoom effect and follows the mouse movement on a selected video source. It is particularly useful for highlighting specific parts of the screen during recordings or live streaming, with support for multi-monitor setups.
+This third-party script for OBS Studio creates a dynamic zoom effect and follows the mouse movement on a selected video source. It is particularly useful for highlighting specific parts of the screen during recordings or live streaming, with support for multi-monitor setups.
 
 **Version 2.0.0 (Refactored 2025)** - Completely rewritten with modern best practices, improved performance, and extensive configurability.
 
@@ -29,10 +31,12 @@ This script for OBS Studio creates a dynamic zoom effect and follows the mouse m
 
 ## Installation
 
-1. Download the `obs-zoom-and-follow-mouse-eg.lua` file
+1. Download the `zoom-follow-mouse-and-more-eg.lua` file (or the latest version from the repository)
 2. In OBS Studio, go to Tools > Scripts
 3. Click the "+" button and select the downloaded file
 4. Configure the script settings according to your preferences
+
+> **Tip**: For visual demonstrations of this script's functionality, check the repository for screenshots or video examples showing the zoom and follow effects in action.
 
 ## Configuration
 
@@ -204,7 +208,24 @@ If you encounter issues with the script, try:
 
 ## Support
 
-To report bugs or request new features, open an issue on GitHub or contact the script's author.
+### Reporting Issues
+
+If you encounter bugs or have feature requests, please:
+
+1. **Check existing issues**: Search the GitHub repository to see if your issue has already been reported
+2. **Create a new issue**: Open a new issue on GitHub with:
+   - A clear description of the problem or feature request
+   - Steps to reproduce the issue (if applicable)
+   - OBS Studio version and operating system
+   - Script logs (enable Debug Mode and include relevant log entries)
+   - Screenshots or videos if the issue is visual
+3. **Alternative contact**: You can also contact the script's author directly
+
+### Getting Help
+
+- Check the [Troubleshooting](#troubleshooting) section below for common issues
+- Enable Debug Mode in script settings for detailed logging
+- Review OBS Studio Script Logs (Tools > Scripts > Script Logs) for error messages
 
 ## License
 
@@ -235,8 +256,12 @@ Edoardo Guzzi
 
 ## Acknowledgments
 
-A special thanks to the OBS Studio community for their support and feedback.
+A special thanks to the OBS Studio community for their support and feedback. This script is developed independently and is not affiliated with the OBS Project.
 
 ## Inspiration
 
 This script is inspired by various zoom and follow scripts in the OBS community, with additional features and improvements for multi-monitor support and smooth transitions.
+
+---
+
+**Disclaimer**: This script is a community-contributed resource. The OBS Project is not responsible for the functionality, support, or maintenance of this script.
