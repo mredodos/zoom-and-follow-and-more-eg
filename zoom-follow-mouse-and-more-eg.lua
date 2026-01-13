@@ -1230,14 +1230,8 @@ local function smooth_zoom_out()
         local mouse_delta_y = math.abs(mouse_y - app_state.last_mouse_pos.y)
         local mouse_distance = math.sqrt(mouse_delta_x * mouse_delta_x + mouse_delta_y * mouse_delta_y)
         
-        -- Only update crop if mouse moved beyond deadzone (prevents flickering when mouse is stationary)
+        -- Always update crop during zoom out to keep the transition smooth
         local should_update = true
-        if app_state.follow.active and mouse_distance < app_state.mouse_deadzone then
-            should_update = false
-            -- Update last_mouse_pos even when skipping update to prevent deadzone accumulation
-            app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
-            -- Continue with zoom out animation even if crop update is skipped
-        end
         
         local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
         
