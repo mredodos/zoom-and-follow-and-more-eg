@@ -47,7 +47,8 @@ Please open an issue on GitHub or contact the script's author if you're interest
 1. Download the `zoom-follow-mouse-and-more-eg.lua` file (or the latest version from the repository)
 2. In OBS Studio, go to Tools > Scripts
 3. Click the "+" button and select the downloaded file
-4. Configure the script settings according to your preferences
+4. Configure the script settings according to your preferences, close the script area.
+5. Assigned shortcuts, go to File → Settings → Hotkeys, find the script's actions "Toggle Zoom"/"Toggle Follow" an assign your preferred shortcuts for them.
 
 > **Tip**: For visual demonstrations of this script's functionality, check the repository for screenshots or video examples showing the zoom and follow effects in action.
 
