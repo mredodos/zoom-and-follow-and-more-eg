@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Zoom, Follow Mouse and MORE for OBS Studio
--- Version 2.0.0 (Refactored 2025)
+-- Version 2.0.1 (Refactored 2025)
 -- ============================================================================
 
 local obs = obslua
@@ -36,7 +36,15 @@ local VALID_SOURCE_TYPES = {
     "window_capture",
     "game_capture",
     "dshow_input",
-    "av_capture_input"
+    "av_capture_input",
+    -- macOS (plugins/mac-capture)
+    "display_capture",   -- Display Capture (legacy)
+    "screen_capture",    -- macOS Screen Capture (ScreenCaptureKit)
+    -- Linux (Wayland/PipeWire + linux-capture)
+    "pipewire-desktop-capture-source",  -- Screen/Window Capture (PipeWire)
+    "xshm_input",        -- Screen capture X11 (XSHM)
+    "xshm_input_v2",     -- Screen capture X11 v2
+    "xcomposite_input"   -- Window Capture (Xcomposite)
 }
 
 -- ============================================================================
@@ -1660,7 +1668,7 @@ end
 
 -- Script description
 function script_description()
-    return "Zoom and follow mouse for OBS Studio. Supports multi-monitor setups. Version 2.0.0 (Refactored 2025)"
+    return "Zoom and follow mouse for OBS Studio. Supports multi-monitor setups. Version 2.0.1 (Refactored 2025)"
 end
 
 -- Script properties
