@@ -1,6 +1,6 @@
 <div align="center">
 
-# Zoom, Follow Mouse & More for OBS Studio
+# Zoom, Follow Mouse & More - By Edoardo Guzzi
 
 **Dynamic zoom and mouse tracking for any video source in OBS.**
 
@@ -11,6 +11,8 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![GitHub stars](https://img.shields.io/github/stars/mredodos/zoom-and-follow-and-more-eg?style=flat-square)
 ![GitHub issues](https://img.shields.io/github/issues/mredodos/zoom-and-follow-and-more-eg?style=flat-square)
+
+[![Changelog](https://img.shields.io/badge/changelog-view-blue?style=flat-square)](CHANGELOG.md)
 
 *Zoom into any part of your screen during recordings or live streams — with smooth animations, mouse follow, and multi-monitor support.*
 
