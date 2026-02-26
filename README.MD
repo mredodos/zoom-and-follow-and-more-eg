@@ -6,9 +6,16 @@
 
 This third-party script for OBS Studio creates a dynamic zoom effect and follows the mouse movement on a selected video source. It is particularly useful for highlighting specific parts of the screen during recordings or live streaming, with support for multi-monitor setups.
 
-**Version 2.0.2 (Refactored 2025)** - Completely rewritten with modern best practices, improved performance, and extensive configurability.
+**Version 2.1.0 (Refactored 2025)** - Completely rewritten with modern best practices, improved performance, and extensive configurability.
 
 ### Changelog
+
+- **2.1.0** — Rewritten zoom and follow animation engine for rock-solid reliability:
+  - **New state-machine architecture**: Zoom uses a single named timer with states (`idle` / `zooming_in` / `zoomed_in` / `zooming_out`) — eliminates timer-leak and double-fire bugs.
+  - **Fixed-endpoint interpolation**: Zoom-in/out lerps between pre-calculated start and end crops instead of recalculating every frame, removing all flickering.
+  - **Stable first-click activation**: Source dimensions are captured *before* the crop filter is applied, so the first hotkey press always works.
+  - **Center-point follow**: Follow mode now interpolates only the viewport center while keeping viewport size locked to the current zoom level — no more zoom drift or flicker during mouse tracking.
+  - **Simplified settings**: Removed redundant "Zoom Speed" slider. Zoom timing is now controlled directly by **Zoom In Duration** and **Zoom Out Duration** (in ms), moved to main settings for easy access.
 
 - **2.0.2** — Fix #7: Increased maximum zoom from 5 to **10**. The limit is now controlled by a single constant (`MAX_ZOOM_VALUE`) so manual edits take effect. Added README note on using **Fit to screen** (Ctrl+F) and high-resolution sources for best quality at high zoom levels.
 
@@ -64,19 +71,21 @@ Please open an issue on GitHub or contact the script's author if you're interest
 
 The script offers several main configuration options:
 
-- **Zoom Value**: Sets the maximum zoom level (from 1.1 to 10)
+- **Zoom Value**: Sets the maximum zoom level (from 1.1 to 100)
   - Default: 2.0
-  - Higher values create more pronounced zoom effect
-  - **Zoom quality (Issue #7)**: For best results with zoom, use **Fit to screen** (Ctrl+F) on your source before activating zoom. For very high zoom levels (e.g. 8–10), use a high-resolution source to avoid a pixelated or blurry image.
-- **Zoom Speed**: Adjusts the speed of the zoom animation (from 0.01 to 1.0)
-  - Default: 0.1
-  - Lower values = slower, smoother zoom
-  - Higher values = faster, more immediate zoom
-- **Follow Speed**: Adjusts the speed of the mouse tracking effect (from 0.01 to 1.0)
-
-  - Default: 1.0 (crop follows mouse immediately; no smoothing)
-  - Lower values = smoother, more gradual following
-  - Higher values = faster, more responsive following
+  - Higher values create more pronounced zoom effect; quality depends on source resolution (e.g. at 50x on a 1080p source you see ~38x21 pixels)
+  - **Zoom quality**: For best results, use **Fit to screen** (Ctrl+F) on your source before activating zoom. For high zoom levels use a high-resolution source to avoid a pixelated image.
+- **Zoom In Duration (ms)**: How long the zoom-in animation takes (1–60000 ms)
+  - Default: **300 ms**
+  - Values below the update interval (~16 ms) are effectively instant (completes in one frame)
+  - **Recommended values**: 1 ms = instant, 150–300 ms = smooth, 500+ ms = slow cinematic
+- **Zoom Out Duration (ms)**: How long the zoom-out animation takes (1–60000 ms)
+  - Default: **500 ms**
+  - Same logic as Zoom In Duration — lower = faster, higher = slower
+- **Follow Speed**: Controls how quickly the viewport tracks the mouse while zoomed in (from 0.01 to 1.0)
+  - Default: **1.0** (viewport snaps to mouse position immediately)
+  - The value is the interpolation factor applied every tick: 1.0 = instant tracking, 0.1 = smooth glide, 0.02 = very slow drift
+  - **Recommended values**: 1.0 for precise, instant tracking (tutorials, coding), 0.1–0.3 for smooth camera movement (presentations, gameplay)
 
 - **Enable Debug Mode**: Toggles detailed logging for troubleshooting
   - Default: false
@@ -122,22 +131,6 @@ The script includes an "Advanced Settings" group with fine-tuning options:
   - Prevents flickering when mouse is at screen edges/corners
   - Higher values = more stable at edges but less responsive
   - Lower values = more responsive but may flicker at edges
-
-#### Animation Settings
-
-- **Zoom In Duration (ms)**: Duration of zoom-in animation (100-1000ms)
-
-  - Default: 300ms
-  - Controls how long it takes to reach full zoom
-  - Lower values = faster zoom
-  - Higher values = slower, more gradual zoom
-
-- **Zoom Out Duration (ms)**: Duration of zoom-out animation (100-1000ms)
-
-  - Default: 500ms
-  - Controls how long it takes to return to normal view
-  - Lower values = faster zoom out
-  - Higher values = slower, more gradual zoom out
 
 - **Scene Transition Duration (ms)**: Duration of transition when changing scenes (100-1000ms)
   - Default: 300ms
@@ -254,6 +247,14 @@ If you encounter bugs or have feature requests, please:
 This script is released under the GNU General Public License v3.0. See the LICENSE file for more details.
 
 ## Version History
+
+### Version 2.1.0 (2025) - Rewritten zoom and follow engine
+
+- **State-machine animation**: Single named timer with `idle` / `zooming_in` / `zoomed_in` / `zooming_out` states, fixing all timer-leak and double-fire bugs.
+- **Fixed-endpoint lerp**: Zoom-in/out smoothly interpolates between pre-calculated start and end crops — no per-frame recalculation, no flickering.
+- **First-click reliability**: Source dimensions are captured before the crop filter is applied, so the very first hotkey press always works.
+- **Center-point follow**: Follow mode only moves the viewport center, keeping viewport size locked to the current zoom level. Eliminates zoom drift and flicker during tracking.
+- **Simplified settings**: Removed the redundant "Zoom Speed" slider. Zoom animation timing is now controlled directly via **Zoom In Duration** and **Zoom Out Duration** (ms), moved from Advanced Settings to the main panel.
 
 ### Version 2.0.2 (2025) - Fix #7 Zoom max and quality
 
