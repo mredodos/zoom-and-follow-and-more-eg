@@ -6,7 +6,11 @@
 
 This third-party script for OBS Studio creates a dynamic zoom effect and follows the mouse movement on a selected video source. It is particularly useful for highlighting specific parts of the screen during recordings or live streaming, with support for multi-monitor setups.
 
-**Version 2.0.0 (Refactored 2025)** - Completely rewritten with modern best practices, improved performance, and extensive configurability.
+**Version 2.0.1 (Refactored 2025)** - Completely rewritten with modern best practices, improved performance, and extensive configurability.
+
+### Changelog
+
+- **2.0.1** — Fix #9, #10, #14, #8 (partial): Added macOS and Linux source types to the script's valid source list. The script now recognizes **Display Capture** and **macOS Screen Capture** on macOS, and **Screen/Window Capture (PipeWire)**, **XSHM**, and **Xcomposite** on Linux, so zoom and follow work with these sources without "No valid video source found" errors.
 
 ## Testing Help Needed
 
