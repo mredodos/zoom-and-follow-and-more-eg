@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Zoom, Follow Mouse and MORE for OBS Studio
--- Version 2.0.1 (Refactored 2025)
+-- Version 2.0.2 (Refactored 2025)
 -- ============================================================================
 
 local obs = obslua
@@ -24,6 +24,7 @@ local DEFAULT_SCENE_TRANSITION_DURATION = 300 -- milliseconds
 local DEFAULT_MOUSE_DEADZONE = 3 -- pixels: minimum mouse movement to trigger crop update
 local DEFAULT_CROP_UPDATE_THRESHOLD = 2 -- pixels: minimum crop change to trigger update
 local DEFAULT_CROP_EDGE_THRESHOLD = 5 -- pixels: increased threshold when crop is at edges
+local MAX_ZOOM_VALUE = 500.0 -- Maximum zoom multiplier (Issue #7)
 local DEFAULT_MONITOR_WIDTH = 1920
 local DEFAULT_MONITOR_HEIGHT = 1080
 
@@ -1584,9 +1585,9 @@ local function validate_settings(settings)
     local follow_spd = obs.obs_data_get_double(settings, "follow_speed")
     
     -- Clamp values to valid ranges
-    if zoom_val < 1.1 or zoom_val > 5.0 then
+    if zoom_val < 1.1 or zoom_val > MAX_ZOOM_VALUE then
         log("warning", "Zoom value out of range, clamping to valid range")
-        obs.obs_data_set_double(settings, "zoom_value", math.max(1.1, math.min(5.0, zoom_val)))
+        obs.obs_data_set_double(settings, "zoom_value", math.max(1.1, math.min(MAX_ZOOM_VALUE, zoom_val)))
     end
     
     if zoom_spd < 0.01 or zoom_spd > 1.0 then
@@ -1676,7 +1677,7 @@ function script_properties()
     local props = obs.obs_properties_create()
     
     -- Main zoom settings
-    obs.obs_properties_add_float_slider(props, "zoom_value", "Zoom Value", 1.1, 5.0, 0.1)
+    obs.obs_properties_add_float_slider(props, "zoom_value", "Zoom Value", 1.1, MAX_ZOOM_VALUE, 0.1)
     obs.obs_properties_add_float_slider(props, "zoom_speed", "Zoom Speed", 0.01, 1.0, 0.01)
     obs.obs_properties_add_float_slider(props, "follow_speed", "Follow Speed", 0.01, 1.0, 0.01)
     
@@ -1704,7 +1705,7 @@ end
 function script_defaults(settings)
     obs.obs_data_set_default_double(settings, "zoom_value", 2.0)
     obs.obs_data_set_default_double(settings, "zoom_speed", 0.1)
-    obs.obs_data_set_default_double(settings, "follow_speed", 0.1)
+    obs.obs_data_set_default_double(settings, "follow_speed", 1.0)
     obs.obs_data_set_default_bool(settings, "debug_mode", false)
     
     -- Advanced settings defaults

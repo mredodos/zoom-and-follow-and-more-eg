@@ -6,9 +6,11 @@
 
 This third-party script for OBS Studio creates a dynamic zoom effect and follows the mouse movement on a selected video source. It is particularly useful for highlighting specific parts of the screen during recordings or live streaming, with support for multi-monitor setups.
 
-**Version 2.0.1 (Refactored 2025)** - Completely rewritten with modern best practices, improved performance, and extensive configurability.
+**Version 2.0.2 (Refactored 2025)** - Completely rewritten with modern best practices, improved performance, and extensive configurability.
 
 ### Changelog
+
+- **2.0.2** — Fix #7: Increased maximum zoom from 5 to **10**. The limit is now controlled by a single constant (`MAX_ZOOM_VALUE`) so manual edits take effect. Added README note on using **Fit to screen** (Ctrl+F) and high-resolution sources for best quality at high zoom levels.
 
 - **2.0.1** — Fix #9, #10, #14, #8 (partial): Added macOS and Linux source types to the script's valid source list. The script now recognizes **Display Capture** and **macOS Screen Capture** on macOS, and **Screen/Window Capture (PipeWire)**, **XSHM**, and **Xcomposite** on Linux, so zoom and follow work with these sources without "No valid video source found" errors.
 
@@ -62,16 +64,17 @@ Please open an issue on GitHub or contact the script's author if you're interest
 
 The script offers several main configuration options:
 
-- **Zoom Value**: Sets the maximum zoom level (from 1.1 to 5.0)
+- **Zoom Value**: Sets the maximum zoom level (from 1.1 to 10)
   - Default: 2.0
   - Higher values create more pronounced zoom effect
+  - **Zoom quality (Issue #7)**: For best results with zoom, use **Fit to screen** (Ctrl+F) on your source before activating zoom. For very high zoom levels (e.g. 8–10), use a high-resolution source to avoid a pixelated or blurry image.
 - **Zoom Speed**: Adjusts the speed of the zoom animation (from 0.01 to 1.0)
   - Default: 0.1
   - Lower values = slower, smoother zoom
   - Higher values = faster, more immediate zoom
 - **Follow Speed**: Adjusts the speed of the mouse tracking effect (from 0.01 to 1.0)
 
-  - Default: 0.1
+  - Default: 1.0 (crop follows mouse immediately; no smoothing)
   - Lower values = smoother, more gradual following
   - Higher values = faster, more responsive following
 
@@ -251,6 +254,15 @@ If you encounter bugs or have feature requests, please:
 This script is released under the GNU General Public License v3.0. See the LICENSE file for more details.
 
 ## Version History
+
+### Version 2.0.2 (2025) - Fix #7 Zoom max and quality
+
+- **Maximum zoom increased to 10**: Zoom Value slider and validation now allow values up to 10 (single constant `MAX_ZOOM_VALUE`).
+- **README**: Note on Fit to screen (Ctrl+F) and high-resolution sources for best quality at high zoom levels.
+
+### Version 2.0.1 (2025) - macOS and Linux source types
+
+- Added macOS and Linux source types so zoom and follow work with Display Capture, Screen Capture, PipeWire, XSHM, and Xcomposite without "No valid video source found" errors.
 
 ### Version 2.0.0 (2025) - Major Refactoring
 
