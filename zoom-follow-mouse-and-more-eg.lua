@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Zoom, Follow Mouse and MORE for OBS Studio
--- Version 2.0.0 (Refactored 2025)
+-- Version 2.1.0 (Refactored 2025)
 -- ============================================================================
 
 local obs = obslua
@@ -24,6 +24,7 @@ local DEFAULT_SCENE_TRANSITION_DURATION = 300 -- milliseconds
 local DEFAULT_MOUSE_DEADZONE = 3 -- pixels: minimum mouse movement to trigger crop update
 local DEFAULT_CROP_UPDATE_THRESHOLD = 2 -- pixels: minimum crop change to trigger update
 local DEFAULT_CROP_EDGE_THRESHOLD = 5 -- pixels: increased threshold when crop is at edges
+local MAX_ZOOM_VALUE = 100.0 -- Maximum zoom multiplier; practical limit depends on source resolution
 local DEFAULT_MONITOR_WIDTH = 1920
 local DEFAULT_MONITOR_HEIGHT = 1080
 
@@ -36,7 +37,15 @@ local VALID_SOURCE_TYPES = {
     "window_capture",
     "game_capture",
     "dshow_input",
-    "av_capture_input"
+    "av_capture_input",
+    -- macOS (plugins/mac-capture)
+    "display_capture",   -- Display Capture (legacy)
+    "screen_capture",    -- macOS Screen Capture (ScreenCaptureKit)
+    -- Linux (Wayland/PipeWire + linux-capture)
+    "pipewire-desktop-capture-source",  -- Screen/Window Capture (PipeWire)
+    "xshm_input",        -- Screen capture X11 (XSHM)
+    "xshm_input_v2",     -- Screen capture X11 v2
+    "xcomposite_input"   -- Window Capture (Xcomposite)
 }
 
 -- ============================================================================
@@ -392,7 +401,6 @@ local app_state = {
     zoom = {
         active = false,
         value = 3.0,
-        speed = 0.2,
         current = 1.0,
         target = 1.0,
         start_time = 0
@@ -412,9 +420,6 @@ local app_state = {
     last_crop = {left = 0, top = 0, right = 0, bottom = 0}, -- Track last crop values to prevent unnecessary updates
     current_scene = nil,
     current_filter_target = nil,
-    animation_timer = nil,
-    zoom_out_timer = nil,
-    zoom_out_in_progress = false,
     cleanup_in_progress = false, -- Flag to prevent timer creation during cleanup
     monitors = {},
     zoom_hotkey_id = nil,
@@ -456,10 +461,6 @@ local function reset_state()
     app_state.current_crop = nil
     app_state.target_crop = nil
     app_state.source_scene_item = nil
-    -- Reset dimension tracking flags
-    app_state._dimension_warning_logged = false
-    app_state._filter_just_applied = false
-    app_state._filter_apply_time = nil
 end
 
 -- ============================================================================
@@ -715,14 +716,6 @@ local function apply_crop_filter(target_source)
         filter_target_name, width, height, 
         obs.obs_source_get_type(filter_target) == obs.OBS_SOURCE_TYPE_SCENE and "SCENE" or "SOURCE"))
     
-    -- Note: We don't verify dimensions immediately after filter application because
-    -- OBS may need a moment to update the source dimensions. The dimensions will be
-    -- validated when get_target_crop() is called, which has retry logic.
-    
-    -- Set a flag to indicate we just applied the filter, so we wait before using dimensions
-    app_state._filter_just_applied = true
-    app_state._filter_apply_time = obs.os_gettime_ns() / 1000000 -- milliseconds
-    
     return true
 end
 
@@ -782,517 +775,311 @@ end
 -- 3. Detection was inaccurate and showed warnings even when CTRL+F was applied
 -- Replaced with simple informational message: show_fit_to_screen_info()
 
--- Calculate target crop based on mouse position and zoom
-local function get_target_crop(mouse_x, mouse_y, current_zoom)
-    -- Debug: Track what target we're using
-    local target_source = app_state.current_filter_target
-    local fallback_source = app_state.source
-    local target = nil
-    local target_type = "none"
-    
-    -- Try to get the filter target, with fallback to source
-    if target_source then
-        target = target_source
-        target_type = "current_filter_target"
-    elseif app_state.crop_filter then
-        -- If filter_target is not set, try to get it from the filter
-        local success, filter_target = pcall(function()
-            return obs.obs_filter_get_parent(app_state.crop_filter)
-        end)
-        if success and filter_target then
-            target = filter_target
-            target_type = "filter_parent"
-            app_state.current_filter_target = filter_target
-            if app_state.debug_mode then
-                log("info", "Retrieved filter target from filter parent")
-            end
-        end
-    end
-    
-    -- Fallback to source if still no target
-    if not target and fallback_source then
-        target = fallback_source
-        target_type = "source_fallback"
-    end
-    
-    if not target then
-        if app_state.debug_mode then
-            log("warning", "get_target_crop: No target available (filter_target: " .. 
-                tostring(target_source ~= nil) .. ", source: " .. tostring(fallback_source ~= nil) .. 
-                ", filter: " .. tostring(app_state.crop_filter ~= nil) .. ")")
-        end
-        return {left = 0, top = 0, right = 0, bottom = 0}
-    end
-    
-    -- Get target name for debugging
-    local target_name = "unknown"
-    pcall(function()
-        target_name = obs.obs_source_get_name(target) or "unknown"
-    end)
-    
-    -- Validate target is still valid
-    -- According to OBS documentation (obs_source_get_width/height), these functions call
-    -- the source's get_width/get_height callbacks, which may return 0 if the source
-    -- dimensions are not yet available (e.g., immediately after filter application).
-    -- We wait a short time after filter application before trying to get dimensions.
-    local source_width, source_height
-    
-    -- If filter was just applied, wait at least 50ms before trying to get dimensions
-    if app_state._filter_just_applied and app_state._filter_apply_time then
-        local current_time = obs.os_gettime_ns() / 1000000 -- milliseconds
-        local elapsed = current_time - app_state._filter_apply_time
-        if elapsed < 50 then
-            -- Still waiting for dimensions to become available
-            if not app_state._dimension_warning_logged then
-                if app_state.debug_mode then
-                    log("info", string.format("Waiting for source dimensions to become available (elapsed: %dms). Target: %s", 
-                        math.floor(elapsed), target_name))
-                end
-                app_state._dimension_warning_logged = true
-            end
-            return {left = 0, top = 0, right = 0, bottom = 0}
-        else
-            -- Enough time has passed, clear the flag
-            app_state._filter_just_applied = false
-            app_state._filter_apply_time = nil
-        end
-    end
-    
-    local success, width_result, height_result = pcall(function()
-        return obs.obs_source_get_width(target), obs.obs_source_get_height(target)
-    end)
-    
-    if success and width_result and height_result then
-        source_width = width_result
-        source_height = height_result
-        
-        -- If dimensions are valid, proceed with crop calculation
-        if source_width > 0 and source_height > 0 then
-            -- Dimensions are valid, continue with crop calculation below
-            -- Reset warning flag when dimensions become valid
-            if app_state._dimension_warning_logged then
-                if app_state.debug_mode then
-                    log("info", string.format("Source dimensions now available: %dx%d. Target: %s", 
-                        source_width, source_height, target_name))
-                end
-                app_state._dimension_warning_logged = false
-            end
-        else
-            -- Dimensions are still 0 - retry on next frame
-            -- Only log once to avoid spam
-            if not app_state._dimension_warning_logged then
-                log("info", string.format("Source dimensions not yet available (0x0) - will retry on next frame. Target: %s", target_name))
-                app_state._dimension_warning_logged = true
-            end
-            return {left = 0, top = 0, right = 0, bottom = 0}
-        end
-    else
-        -- Failed to get dimensions - source may be invalid
-        if app_state.debug_mode then
-            log("warning", string.format("Failed to get source dimensions for target: %s", target_name))
-        end
-        return {left = 0, top = 0, right = 0, bottom = 0}
-    end
-    
-    -- Reset warning flag if dimensions are now valid (already handled above)
-    
-    
-    -- Find monitor where mouse is located
-    local current_monitor = app_state.monitors[1] or {left = 0, top = 0, right = app_state.default_monitor_width, bottom = app_state.default_monitor_height}
-    for _, monitor in ipairs(app_state.monitors) do
-        if mouse_x >= monitor.left and mouse_x < monitor.right and
-           mouse_y >= monitor.top and mouse_y < monitor.bottom then
-            current_monitor = monitor
-            break
-        end
-    end
-    
-    local screen_width = current_monitor.right - current_monitor.left
-    local screen_height = current_monitor.bottom - current_monitor.top
-    
-    if screen_width == 0 or screen_height == 0 then
-        return {left = 0, top = 0, right = 0, bottom = 0}
-    end
-    
-    -- Get displayed dimensions considering scene item transformations (scale, crop)
-    -- Note: This is used for mouse-to-source coordinate mapping, not for detecting if source is fitted
-    local displayed_width = source_width
-    local displayed_height = source_height
-    
-    if app_state.source_scene_item then
-        local scale_x, scale_y = 1.0, 1.0
-        local success = pcall(function()
-            -- Try to create vec2 and get scale
-            if obs.vec2 then
-                local scale_vec = obs.vec2()
-                obs.obs_sceneitem_get_scale(app_state.source_scene_item, scale_vec)
-                scale_x = scale_vec.x
-                scale_y = scale_vec.y
-            else
-                -- Fallback: try direct call
-                local scale_result = obs.obs_sceneitem_get_scale(app_state.source_scene_item)
-                if scale_result and type(scale_result) == "table" then
-                    scale_x = scale_result.x or 1.0
-                    scale_y = scale_result.y or 1.0
-                end
-            end
-        end)
-        
-        if scale_x and scale_y then
-            
-            -- Get crop applied to scene item (if any)
-            local crop_success, crop_result = pcall(function()
-                return obs.obs_sceneitem_get_crop(app_state.source_scene_item)
-            end)
-            
-            if crop_success and crop_result then
-                -- Calculate displayed dimensions: (native - crop) * scale
-                displayed_width = (source_width - (crop_result.left or 0) - (crop_result.right or 0)) * scale_x
-                displayed_height = (source_height - (crop_result.top or 0) - (crop_result.bottom or 0)) * scale_y
-            else
-                -- No crop, just apply scale
-                displayed_width = source_width * scale_x
-                displayed_height = source_height * scale_y
-            end
-        end
-    end
-    
-    -- Use displayed dimensions for crop calculation
-    -- Map mouse position from screen space to source native space
-    -- If source is displayed at displayed_width x displayed_height on screen,
-    -- then: mouse_x_in_source = (mouse_x - monitor.left) * (source_width / displayed_width)
-    -- This works correctly when source is fitted to screen (CTRL+F)
-    -- When not fitted, the mapping may be less accurate but still functional
-    local mouse_x_in_source = (mouse_x - current_monitor.left) * (source_width / displayed_width)
-    local mouse_y_in_source = (mouse_y - current_monitor.top) * (source_height / displayed_height)
-    
-    local target_width = math.floor(source_width / current_zoom)
-    local target_height = math.floor(source_height / current_zoom)
-    
-    local target_x = math.floor(mouse_x_in_source - (target_width / 2))
-    local target_y = math.floor(mouse_y_in_source - (target_height / 2))
-    
-    target_x = math.max(0, math.min(target_x, source_width - target_width))
-    target_y = math.max(0, math.min(target_y, source_height - target_height))
-    
-    return {
-        left = target_x,
-        top = target_y,
-        right = source_width - (target_x + target_width),
-        bottom = source_height - (target_y + target_height)
-    }
-end
-
--- ============================================================================
--- CROP INTERPOLATION AND UPDATE HELPERS
--- ============================================================================
-
--- Apply follow speed interpolation to crop and handle edge cases
--- Returns the interpolated crop with anti-flickering logic for edges
-local function apply_follow_interpolation(new_crop, mouse_distance)
-    if not app_state.follow.active then
-        return new_crop
-    end
-    
-    app_state.current_crop = app_state.current_crop or {left = 0, top = 0, right = 0, bottom = 0}
-    
-    -- Calculate interpolated crop with follow speed
-    local interpolated_crop = {
-        left = app_state.current_crop.left + (new_crop.left - app_state.current_crop.left) * app_state.follow.speed,
-        top = app_state.current_crop.top + (new_crop.top - app_state.current_crop.top) * app_state.follow.speed,
-        right = app_state.current_crop.right + (new_crop.right - app_state.current_crop.right) * app_state.follow.speed,
-        bottom = app_state.current_crop.bottom + (new_crop.bottom - app_state.current_crop.bottom) * app_state.follow.speed
-    }
-    
-    -- Check if we're at the edges (crop values are at 0 or near 0)
-    local is_at_left_edge = interpolated_crop.left <= 1
-    local is_at_top_edge = interpolated_crop.top <= 1
-    local is_at_right_edge = interpolated_crop.right <= 1
-    local is_at_bottom_edge = interpolated_crop.bottom <= 1
-    local is_at_edge = is_at_left_edge or is_at_top_edge or is_at_right_edge or is_at_bottom_edge
-    
-    -- If at edge and mouse hasn't moved significantly, use current crop to prevent flickering
-    if is_at_edge and mouse_distance < app_state.mouse_deadzone * 2 then
-        -- Keep current crop when at edges and mouse is stationary
-        return {
-            left = app_state.current_crop.left,
-            top = app_state.current_crop.top,
-            right = app_state.current_crop.right,
-            bottom = app_state.current_crop.bottom
-        }
-    else
-        -- Apply interpolated crop
-        return interpolated_crop
-    end
-end
-
--- Update crop if change exceeds threshold (with edge-aware threshold)
--- Returns true if crop was updated, false otherwise
-local function update_crop_if_needed(new_crop, should_update)
-    if not should_update then
-        return false
-    end
-    
-    local crop_delta_left = math.abs(new_crop.left - app_state.last_crop.left)
-    local crop_delta_top = math.abs(new_crop.top - app_state.last_crop.top)
-    local crop_delta_right = math.abs(new_crop.right - app_state.last_crop.right)
-    local crop_delta_bottom = math.abs(new_crop.bottom - app_state.last_crop.bottom)
-    
-    local max_crop_delta = math.max(crop_delta_left, crop_delta_top, crop_delta_right, crop_delta_bottom)
-    
-    -- Use higher threshold when at edges to prevent flickering
-    local is_at_edge = (app_state.last_crop.left <= 1 or app_state.last_crop.top <= 1 or 
-                       app_state.last_crop.right <= 1 or app_state.last_crop.bottom <= 1)
-    local threshold = is_at_edge and app_state.crop_edge_threshold or app_state.crop_update_threshold
-    
-    if max_crop_delta >= threshold then
-        update_crop(new_crop.left, new_crop.top, new_crop.right, new_crop.bottom)
-        app_state.last_crop = {
-            left = new_crop.left,
-            top = new_crop.top,
-            right = new_crop.right,
-            bottom = new_crop.bottom
-        }
-        return true
-    end
-    
-    return false
-end
 
 -- ============================================================================
 -- ANIMATION HANDLERS
 -- ============================================================================
 
--- Main zoom animation handler
-local function animate_zoom()
-    -- CRITICAL: Check if app_state exists (prevents crash if script is unloaded)
-    if not app_state then
-        return
-    end
-    
-    -- Validate source before using it
-    if not app_state.source then
-        if app_state.animation_timer then
-            obs.timer_remove(animate_zoom)
-            app_state.animation_timer = nil
-            log("warning", "Animation timer removed - source is nil")
-        end
-        return
-    end
-    
-    -- Check if source is still valid
-    local source_valid = pcall(function()
-        obs.obs_source_get_width(app_state.source)
-    end)
-    
-    if not source_valid then
-        log("warning", "Source became invalid, stopping animation and deactivating zoom/follow")
-        app_state.zoom.active = false
-        app_state.follow.active = false
-        if app_state.animation_timer then
-            obs.timer_remove(animate_zoom)
-            app_state.animation_timer = nil
-            log("info", "Animation timer removed due to invalid source")
-        end
-        -- Note: Sources from scene items are managed by OBS, no need to release
-        app_state.source = nil
-        app_state.source_scene_item = nil
-        return
-    end
-    
-    -- Handle zoom animation
-    local current_time = obs.os_gettime_ns() / 1000000 -- Convert to milliseconds
-    local elapsed_time = current_time - app_state.zoom.start_time
-    local progress = math.min(elapsed_time / app_state.zoom_animation_duration, 1.0)
-    
-    if app_state.zoom.active then
-        app_state.zoom.current = 1.0 + (app_state.zoom.target - 1.0) * progress * app_state.zoom.speed
-    end
-    
-    -- If follow is not active, only update crop during zoom animation, then stop timer
-    if not app_state.follow.active then
-        -- During zoom animation, center crop on mouse
-        if app_state.zoom.active and progress < 1.0 then
-            local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
-            local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
-            update_crop_if_needed(new_crop, true)
-            app_state.current_crop = new_crop
-            app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
-        elseif progress >= 1.0 then
-            -- Zoom animation complete: crop stays fixed, stop timer
-            if app_state.animation_timer then
-                obs.timer_remove(animate_zoom)
-                app_state.animation_timer = nil
-                log("info", "Animation timer removed - zoom complete, follow inactive")
-            end
-        end
-        return
-    end
-    
-    -- Follow is active: crop follows mouse with interpolation
-    local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
-    
-    -- Calculate mouse movement distance
-    local mouse_delta_x = math.abs(mouse_x - app_state.last_mouse_pos.x)
-    local mouse_delta_y = math.abs(mouse_y - app_state.last_mouse_pos.y)
-    local mouse_distance = math.sqrt(mouse_delta_x * mouse_delta_x + mouse_delta_y * mouse_delta_y)
-    
-    -- Only update crop if mouse moved beyond deadzone (prevents flickering when mouse is stationary)
-    local should_update = true
-    if mouse_distance < app_state.mouse_deadzone then
-        should_update = false
-        app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
-        return -- Exit early to avoid unnecessary calculations
-    end
-    
-    local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
-    
-    -- Apply follow interpolation (handles edge cases)
-    new_crop = apply_follow_interpolation(new_crop, mouse_distance)
-    
-    -- Update crop if needed (handles threshold logic)
-    update_crop_if_needed(new_crop, should_update)
-    
-    app_state.current_crop = new_crop
-    app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
+-- Architecture: single named timer + state machine + lerp between FIXED crops.
+-- Crops are calculated ONCE at animation start, then we only lerp.
+-- This eliminates flickering caused by recalculating crop every frame.
+
+local zoom_state = "idle" -- "idle" | "zooming_in" | "zoomed_in" | "zooming_out"
+local zoom_timer_running = false
+
+local zoom_anim = {
+    start_time = 0,
+    duration = 0,
+    -- Fixed crop endpoints: set once, never change during animation
+    start_crop = {left = 0, top = 0, right = 0, bottom = 0},
+    end_crop   = {left = 0, top = 0, right = 0, bottom = 0},
+}
+
+local function lerp(a, b, t)
+    return a + (b - a) * t
 end
 
--- Smooth zoom out animation
-local function smooth_zoom_out()
-    -- CRITICAL: Check if app_state exists and cleanup is not in progress
-    if not app_state or app_state.cleanup_in_progress then
-        log("warning", "Cannot start zoom out - cleanup in progress or app_state invalid")
+local function copy_crop(c)
+    return {left = c.left, top = c.top, right = c.right, bottom = c.bottom}
+end
+
+-- Single named tick: handles zooming_in, zooming_out, and follow
+local function on_zoom_tick()
+    if not app_state then return end
+
+    if not app_state.source then
+        obs.timer_remove(on_zoom_tick)
+        zoom_timer_running = false
         return
     end
-    
-    -- Prevent multiple zoom out animations
-    if app_state.zoom_out_in_progress then
-        log("warning", "Zoom out already in progress, skipping")
+    local ok = pcall(function() obs.obs_source_get_width(app_state.source) end)
+    if not ok then
+        app_state.zoom.active = false
+        app_state.follow.active = false
+        app_state.source = nil
+        app_state.source_scene_item = nil
+        obs.timer_remove(on_zoom_tick)
+        zoom_timer_running = false
         return
     end
-    
-    log("info", "Starting smooth zoom out animation")
-    
-    local start_zoom = app_state.zoom.current
-    local start_time = obs.os_gettime_ns() / 1000000 -- Convert to milliseconds
-    
-    -- Stop any existing timers
-    if app_state.animation_timer then
-        obs.timer_remove(animate_zoom)
-        app_state.animation_timer = nil
-    end
-    
-    if app_state.zoom_out_timer then
-        obs.timer_remove(app_state.zoom_out_timer)
-        app_state.zoom_out_timer = nil
-    end
-    
-    app_state.zoom_out_in_progress = true
-    
-    -- Create timer for zoom out animation
-    app_state.zoom_out_timer = obs.timer_add(function()
-        -- CRITICAL: Check if app_state exists (prevents crash if script is unloaded)
-        if not app_state then
-            return
+
+    -- === ANIMATION (zoom-in or zoom-out) ===
+    if zoom_state == "zooming_in" or zoom_state == "zooming_out" then
+        local now = obs.os_gettime_ns() / 1000000
+        local t = math.min((now - zoom_anim.start_time) / zoom_anim.duration, 1.0)
+
+        -- Lerp between the two FIXED crop endpoints
+        local crop = {
+            left   = lerp(zoom_anim.start_crop.left,   zoom_anim.end_crop.left,   t),
+            top    = lerp(zoom_anim.start_crop.top,    zoom_anim.end_crop.top,    t),
+            right  = lerp(zoom_anim.start_crop.right,  zoom_anim.end_crop.right,  t),
+            bottom = lerp(zoom_anim.start_crop.bottom, zoom_anim.end_crop.bottom, t),
+        }
+
+        update_crop(crop.left, crop.top, crop.right, crop.bottom)
+        app_state.last_crop = copy_crop(crop)
+        app_state.current_crop = crop
+
+        -- Update zoom.current proportionally for consistency
+        if zoom_state == "zooming_in" then
+            app_state.zoom.current = lerp(1.0, app_state.zoom.value, t)
+        else
+            app_state.zoom.current = lerp(zoom_anim._start_zoom_level, 1.0, t)
         end
-        
-        -- CRITICAL: Check if zoom out is still in progress (prevents loop after completion)
-        if not app_state.zoom_out_in_progress then
-            -- Timer was already completed, remove it immediately
-            if app_state.zoom_out_timer then
-                obs.timer_remove(app_state.zoom_out_timer)
-                app_state.zoom_out_timer = nil
-            end
-            return
-        end
-        
-        -- Early exit if zoom was reactivated
-        if app_state.zoom.active then
-            app_state.zoom_out_in_progress = false
-            if app_state.zoom_out_timer then
-                obs.timer_remove(app_state.zoom_out_timer)
-                app_state.zoom_out_timer = nil
-            end
-            return
-        end
-        
-        local current_time = obs.os_gettime_ns() / 1000000
-        local elapsed = current_time - start_time
-        local progress = math.min(elapsed / app_state.zoom_out_duration, 1.0)
-        
-        local eased_progress = ease_out(progress)
-        app_state.zoom.current = start_zoom + (1.0 - start_zoom) * eased_progress
-        
-        local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
-        
-        -- Calculate mouse movement distance
-        local mouse_delta_x = math.abs(mouse_x - app_state.last_mouse_pos.x)
-        local mouse_delta_y = math.abs(mouse_y - app_state.last_mouse_pos.y)
-        local mouse_distance = math.sqrt(mouse_delta_x * mouse_delta_x + mouse_delta_y * mouse_delta_y)
-        
-        -- Only update crop if mouse moved beyond deadzone (prevents flickering when mouse is stationary)
-        local should_update = true
-        if app_state.follow.active and mouse_distance < app_state.mouse_deadzone then
-            should_update = false
-            -- Update last_mouse_pos even when skipping update to prevent deadzone accumulation
-            app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
-            -- Continue with zoom out animation even if crop update is skipped
-        end
-        
-        local new_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
-        
-        -- Apply follow interpolation (handles edge cases)
-        new_crop = apply_follow_interpolation(new_crop, mouse_distance)
-        
-        -- Update crop if needed (handles threshold logic)
-        update_crop_if_needed(new_crop, should_update)
-        
-        app_state.current_crop = new_crop
-        app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
-        
-        if progress >= 1.0 then
-            -- CRITICAL: Mark as completed FIRST, then remove timer
-            app_state.zoom_out_in_progress = false
-            
-            -- CRITICAL: Remove timer IMMEDIATELY to prevent further callbacks
-            local timer_to_remove = app_state.zoom_out_timer
-            app_state.zoom_out_timer = nil
-            if timer_to_remove then
-                obs.timer_remove(timer_to_remove)
-            end
-            
-            -- Now safe to log and cleanup
-            log("info", "Zoom out animation completed - cleaning up resources")
-            
-            app_state.zoom.active = false
-            app_state.zoom.current = 1.0 -- Reset zoom to default
-            app_state.current_crop = nil
-            app_state.last_mouse_pos = {x = 0, y = 0}
-            app_state.last_crop = {left = 0, top = 0, right = 0, bottom = 0}
-            
-            -- Always remove filter when zoom is deactivated
-            if app_state.crop_filter and app_state.current_filter_target then
-                log("info", "Removing crop filter after zoom out")
-                pcall(function()
-                    obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
-                end)
-                -- Release filter only if we created it (protected with pcall)
-                if app_state.crop_filter_owned then
-                    pcall(function()
-                        obs.obs_source_release(app_state.crop_filter)
-                    end)
-                    log("info", "Crop filter released")
+
+        -- Transition when animation completes
+        if t >= 1.0 then
+            if zoom_state == "zooming_in" then
+                app_state.zoom.current = app_state.zoom.value
+                zoom_state = "zoomed_in"
+                log("info", "Zoom in complete")
+                if not app_state.follow.active then
+                    obs.timer_remove(on_zoom_tick)
+                    zoom_timer_running = false
                 end
-                app_state.crop_filter = nil
-                app_state.crop_filter_owned = false
-                app_state.current_filter_target = nil
-                log("info", "Filter removed after zoom out")
+
+            elseif zoom_state == "zooming_out" then
+                -- Reset everything
+                app_state.zoom.current = 1.0
+                app_state.zoom.active = false
+                app_state.current_crop = nil
+                app_state.last_crop = {left = 0, top = 0, right = 0, bottom = 0}
+                zoom_state = "idle"
+                obs.timer_remove(on_zoom_tick)
+                zoom_timer_running = false
+
+                -- Remove crop filter
+                if app_state.crop_filter and app_state.current_filter_target then
+                    pcall(function()
+                        obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
+                    end)
+                    if app_state.crop_filter_owned then
+                        pcall(function() obs.obs_source_release(app_state.crop_filter) end)
+                    end
+                    app_state.crop_filter = nil
+                    app_state.crop_filter_owned = false
+                    app_state.current_filter_target = nil
+                end
+                log("info", "Zoom out complete, filter removed")
             end
-            
-            log("info", "Zoom out cleanup completed")
-            return -- Exit immediately after completion
         end
-    end, app_state.update_interval)
+        return
+    end
+
+    -- === FOLLOW MODE (zoomed_in + follow active) ===
+    -- Interpolate the viewport CENTER toward the mouse, keeping viewport SIZE fixed.
+    -- This prevents zoom-level drift that happens when interpolating 4 crop values independently.
+    if zoom_state == "zoomed_in" and app_state.follow.active then
+        local mx, my = ffi_platform.get_mouse_pos()
+        local dx = math.abs(mx - app_state.last_mouse_pos.x)
+        local dy = math.abs(my - app_state.last_mouse_pos.y)
+        local dist = math.sqrt(dx * dx + dy * dy)
+
+        if dist < app_state.mouse_deadzone then
+            app_state.last_mouse_pos = {x = mx, y = my}
+            return
+        end
+
+        local dims = app_state._src_dims
+        if not dims then return end
+        local src_w, src_h = dims.w, dims.h
+
+        -- Fixed viewport size at current zoom (never changes during follow)
+        local view_w = math.max(4, math.min(math.floor(src_w / app_state.zoom.current), src_w))
+        local view_h = math.max(4, math.min(math.floor(src_h / app_state.zoom.current), src_h))
+
+        -- Current viewport center (derived from current_crop)
+        local cur = app_state.current_crop or {left = 0, top = 0, right = 0, bottom = 0}
+        local cur_cx = cur.left + view_w / 2
+        local cur_cy = cur.top  + view_h / 2
+
+        -- Find the monitor the mouse is on
+        local monitor = app_state.monitors[1] or {
+            left = 0, top = 0, right = src_w, bottom = src_h
+        }
+        for _, m in ipairs(app_state.monitors) do
+            if mx >= m.left and mx < m.right and my >= m.top and my < m.bottom then
+                monitor = m
+                break
+            end
+        end
+
+        -- Target center = mouse position in source coords
+        local tgt_cx = mx - monitor.left
+        local tgt_cy = my - monitor.top
+        if tgt_cx < 0 or tgt_cx > src_w or tgt_cy < 0 or tgt_cy > src_h then
+            tgt_cx = src_w / 2
+            tgt_cy = src_h / 2
+        end
+
+        -- Smoothly move center toward target
+        local spd = app_state.follow.speed
+        local new_cx = cur_cx + (tgt_cx - cur_cx) * spd
+        local new_cy = cur_cy + (tgt_cy - cur_cy) * spd
+
+        -- Convert center back to crop (clamped to source bounds)
+        local new_left = math.max(0, math.min(math.floor(new_cx - view_w / 2), src_w - view_w))
+        local new_top  = math.max(0, math.min(math.floor(new_cy - view_h / 2), src_h - view_h))
+        local final = {
+            left   = new_left,
+            top    = new_top,
+            right  = src_w - (new_left + view_w),
+            bottom = src_h - (new_top  + view_h),
+        }
+
+        update_crop(final.left, final.top, final.right, final.bottom)
+        app_state.last_crop = copy_crop(final)
+        app_state.current_crop = final
+        app_state.last_mouse_pos = {x = mx, y = my}
+    end
+end
+
+-- Helper: ensure the tick timer is running
+local function ensure_zoom_timer()
+    if not zoom_timer_running then
+        obs.timer_add(on_zoom_tick, app_state.update_interval)
+        zoom_timer_running = true
+    end
+end
+
+-- Helper: stop the tick timer
+local function stop_zoom_timer()
+    if zoom_timer_running then
+        obs.timer_remove(on_zoom_tick)
+        zoom_timer_running = false
+    end
+end
+
+-- Pure crop math from known dimensions. Does NOT query OBS for source size
+-- (after filter_add, obs_source_get_width returns 0 for ~1 frame).
+local function calc_zoom_crop(mouse_x, mouse_y, zoom_level, src_w, src_h)
+    if src_w <= 0 or src_h <= 0 or zoom_level <= 1.0 then
+        return {left = 0, top = 0, right = 0, bottom = 0}
+    end
+
+    -- Find the monitor the mouse is on
+    local monitor = app_state.monitors[1] or {
+        left = 0, top = 0,
+        right = app_state.default_monitor_width,
+        bottom = app_state.default_monitor_height
+    }
+    for _, m in ipairs(app_state.monitors) do
+        if mouse_x >= m.left and mouse_x < m.right and
+           mouse_y >= m.top and mouse_y < m.bottom then
+            monitor = m
+            break
+        end
+    end
+
+    local mx_src = mouse_x - monitor.left
+    local my_src = mouse_y - monitor.top
+
+    if mx_src < 0 or mx_src > src_w or my_src < 0 or my_src > src_h then
+        mx_src = src_w / 2
+        my_src = src_h / 2
+    end
+
+    local view_w = math.max(4, math.min(math.floor(src_w / zoom_level), src_w))
+    local view_h = math.max(4, math.min(math.floor(src_h / zoom_level), src_h))
+
+    local cx = math.max(0, math.min(math.floor(mx_src - view_w / 2), src_w - view_w))
+    local cy = math.max(0, math.min(math.floor(my_src - view_h / 2), src_h - view_h))
+
+    return {
+        left   = cx,
+        top    = cy,
+        right  = src_w - (cx + view_w),
+        bottom = src_h - (cy + view_h)
+    }
+end
+
+-- Start smooth zoom-in. src_w/src_h are pre-filter dimensions (must be passed
+-- when starting from idle because obs_source_get_width returns 0 after filter_add).
+-- When interrupting zoom-out, pass nil and saved _src_dims will be used.
+local function start_zoom_in(src_w, src_h)
+    local mx, my = ffi_platform.get_mouse_pos()
+
+    -- Priority: 1) passed args, 2) saved session dims, 3) query source
+    if (not src_w or src_w <= 0) and app_state._src_dims then
+        src_w = app_state._src_dims.w
+        src_h = app_state._src_dims.h
+    end
+    if (not src_w or src_w <= 0) then
+        pcall(function()
+            src_w = obs.obs_source_get_width(app_state.source)
+            src_h = obs.obs_source_get_height(app_state.source)
+        end)
+    end
+    if not src_w or src_w <= 0 or not src_h or src_h <= 0 then
+        log("error", "Cannot start zoom in: no valid dimensions")
+        return
+    end
+
+    app_state._src_dims = {w = src_w, h = src_h}
+
+    local target = calc_zoom_crop(mx, my, app_state.zoom.value, src_w, src_h)
+
+    -- If current crop exists (e.g. interrupting zoom-out), use it as start
+    if app_state.last_crop and (app_state.last_crop.left ~= 0 or app_state.last_crop.top ~= 0
+        or app_state.last_crop.right ~= 0 or app_state.last_crop.bottom ~= 0) then
+        zoom_anim.start_crop = copy_crop(app_state.last_crop)
+    else
+        zoom_anim.start_crop = {left = 0, top = 0, right = 0, bottom = 0}
+    end
+    zoom_anim.end_crop = copy_crop(target)
+    zoom_anim.start_time = obs.os_gettime_ns() / 1000000
+    zoom_anim.duration = app_state.zoom_animation_duration
+    zoom_anim._start_zoom_level = app_state.zoom.current
+
+    zoom_state = "zooming_in"
+    app_state.zoom.active = true
+    app_state.zoom.target = app_state.zoom.value
+    app_state.last_mouse_pos = {x = mx, y = my}
+    ensure_zoom_timer()
+    log("info", string.format("Zoom in: crop [%d,%d,%d,%d] -> [%d,%d,%d,%d] over %d ms",
+        zoom_anim.start_crop.left, zoom_anim.start_crop.top,
+        zoom_anim.start_crop.right, zoom_anim.start_crop.bottom,
+        zoom_anim.end_crop.left, zoom_anim.end_crop.top,
+        zoom_anim.end_crop.right, zoom_anim.end_crop.bottom,
+        zoom_anim.duration))
+end
+
+-- Start smooth zoom-out: from current crop to {0,0,0,0}
+local function start_zoom_out()
+    if not app_state or app_state.cleanup_in_progress then return end
+
+    zoom_anim.start_crop = copy_crop(app_state.last_crop or {left = 0, top = 0, right = 0, bottom = 0})
+    zoom_anim.end_crop = {left = 0, top = 0, right = 0, bottom = 0}
+    zoom_anim.start_time = obs.os_gettime_ns() / 1000000
+    zoom_anim.duration = app_state.zoom_out_duration
+    zoom_anim._start_zoom_level = app_state.zoom.current
+
+    zoom_state = "zooming_out"
+    ensure_zoom_timer()
+    log("info", string.format("Zoom out: crop [%d,%d,%d,%d] -> [0,0,0,0] over %d ms",
+        zoom_anim.start_crop.left, zoom_anim.start_crop.top,
+        zoom_anim.start_crop.right, zoom_anim.start_crop.bottom,
+        zoom_anim.duration))
 end
 
 -- ============================================================================
@@ -1313,13 +1100,9 @@ local function on_zoom_hotkey(pressed)
             return
         end
     else
-        -- Verify source is still valid
-        local source_valid = pcall(function()
-            obs.obs_source_get_width(app_state.source)
-        end)
+        local source_valid = pcall(function() obs.obs_source_get_width(app_state.source) end)
         if not source_valid then
             log("warning", "Source became invalid, searching for new one")
-            -- Note: Sources from scene items are managed by OBS, no need to release
             app_state.source = nil
             app_state.source = find_valid_video_source()
             if not app_state.source then
@@ -1329,111 +1112,71 @@ local function on_zoom_hotkey(pressed)
         end
     end
     
-    -- CRITICAL: Validate source has valid dimensions before proceeding
     local is_valid, error_msg = validate_source_dimensions(app_state.source)
     if not is_valid then
         log("error", "Cannot activate zoom: " .. tostring(error_msg))
-        log("error", "Please ensure the source has valid dimensions before activating zoom")
         return
     end
     
-    -- Show informational message about CTRL+F (only in debug mode)
-    -- Note: OBS API doesn't provide a reliable way to detect if source is fitted to screen
-    -- So we just show a helpful tip instead of trying to detect it
     show_fit_to_screen_info()
     
-    if app_state.zoom.active then
-        -- Deactivate zoom
-        log("info", "Deactivating zoom - stopping all timers immediately")
-        
-        -- Stop all timers IMMEDIATELY to prevent performance issues
-        if app_state.animation_timer then
-            obs.timer_remove(animate_zoom)
-            app_state.animation_timer = nil
-            log("info", "Animation timer removed")
-        end
-        
-        if app_state.zoom_out_timer then
-            obs.timer_remove(app_state.zoom_out_timer)
-            app_state.zoom_out_timer = nil
-            log("info", "Zoom out timer removed")
-        end
-        
-        app_state.zoom.active = false
-        app_state.follow.active = false -- Also deactivate follow when zoom is deactivated
-        app_state.zoom_out_in_progress = false
-        
-        -- Start smooth zoom out animation
-        smooth_zoom_out()
+    -- Toggle: if zoomed in or zooming in -> zoom out; if idle or zooming out -> zoom in
+    if zoom_state == "zoomed_in" or zoom_state == "zooming_in" then
+        log("info", "Deactivating zoom")
+        app_state.follow.active = false
+        start_zoom_out()
+
+    elseif zoom_state == "zooming_out" then
+        -- Interrupt zoom-out: reuse existing filter, start zoom-in from current level
+        log("info", "Interrupting zoom-out, reversing to zoom-in")
+        app_state.follow.active = false
+        start_zoom_in()
+
     else
-        -- Stop any existing animation before starting new one
-        log("info", "Activating zoom")
-        
-        -- CRITICAL: Stop zoom out animation FIRST
-        app_state.zoom_out_in_progress = false
-        if app_state.zoom_out_timer then
-            obs.timer_remove(app_state.zoom_out_timer)
-            app_state.zoom_out_timer = nil
-        end
-        
-        if app_state.animation_timer then
-            obs.timer_remove(animate_zoom)
-            app_state.animation_timer = nil
-        end
-        
-        -- Ensure filter is cleaned up before reactivating
+        -- Starting from idle: need fresh filter
+        log("info", "Activating zoom from idle")
+        stop_zoom_timer()
+
+        -- Clean up old filter if present
         if app_state.crop_filter and app_state.current_filter_target then
             pcall(function()
                 obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
             end)
             if app_state.crop_filter_owned then
-                pcall(function()
-                    obs.obs_source_release(app_state.crop_filter)
-                end)
+                pcall(function() obs.obs_source_release(app_state.crop_filter) end)
             end
             app_state.crop_filter = nil
             app_state.crop_filter_owned = false
             app_state.current_filter_target = nil
         end
         
-        -- Revalidate source dimensions before reactivating
-        local is_valid, error_msg = validate_source_dimensions(app_state.source)
-        if not is_valid then
-            log("error", "Cannot reactivate zoom: " .. tostring(error_msg))
-            log("error", "Please ensure the source has valid dimensions before activating zoom")
+        local is_valid2, error_msg2 = validate_source_dimensions(app_state.source)
+        if not is_valid2 then
+            log("error", "Cannot activate zoom: " .. tostring(error_msg2))
             return
         end
         
-        -- Reset zoom state completely
+        -- Capture dimensions BEFORE applying filter (after filter_add, get_width returns 0)
+        local pre_w = obs.obs_source_get_width(app_state.source)
+        local pre_h = obs.obs_source_get_height(app_state.source)
+        
         app_state.zoom.current = 1.0
-        app_state.zoom.active = true
-        app_state.follow.active = false  -- Reset follow state when zoom is activated
+        app_state.follow.active = false
         app_state.current_crop = nil
         app_state.last_mouse_pos = {x = 0, y = 0}
         app_state.last_crop = {left = 0, top = 0, right = 0, bottom = 0}
         
-        -- Reapply filter (returns false if source has invalid dimensions)
         local filter_applied = apply_crop_filter(app_state.source)
         if not filter_applied then
-            log("error", "Failed to apply crop filter - zoom activation cancelled")
-            app_state.zoom.active = false
+            log("error", "Failed to apply crop filter - zoom cancelled")
             return
         end
         
         if not app_state.original_crop then
             app_state.original_crop = {left = 0, top = 0, right = 0, bottom = 0}
         end
-        app_state.zoom.target = app_state.zoom.value
-        app_state.zoom.start_time = obs.os_gettime_ns() / 1000000
         
-        app_state.animation_timer = obs.timer_add(animate_zoom, app_state.update_interval)
-        log("info", string.format("Zoom activated - target: %.2f, speed: %.2f", 
-            app_state.zoom.target, app_state.zoom.speed))
-    end
-    
-    log("info", "Zoom " .. (app_state.zoom.active and "activated" or "deactivating"))
-    if not app_state.zoom.active then
-        log("info", "Follow deactivated automatically")
+        start_zoom_in(pre_w, pre_h)
     end
 end
 
@@ -1450,19 +1193,13 @@ local function on_follow_hotkey(pressed)
     
     app_state.follow.active = not app_state.follow.active
     if app_state.follow.active then
-        -- Always ensure timer is running when follow is activated
-        if not app_state.animation_timer then
-            app_state.animation_timer = obs.timer_add(animate_zoom, app_state.update_interval)
-            log("info", "Animation timer started for follow mode")
-        end
+        ensure_zoom_timer()
         log("info", string.format("Follow activated - speed: %.2f", app_state.follow.speed))
     else
         log("info", "Follow deactivated")
-        -- Only remove timer if zoom is also inactive
-        if not app_state.zoom.active and app_state.animation_timer then
-            obs.timer_remove(animate_zoom)
-            app_state.animation_timer = nil
-            log("info", "Animation timer removed - both zoom and follow inactive")
+        if zoom_state == "zoomed_in" then
+            stop_zoom_timer()
+            log("info", "Timer stopped - follow off, zoom static")
         end
     end
 end
@@ -1510,40 +1247,24 @@ local function on_scene_change()
             apply_crop_filter(app_state.source)
             
             if app_state.zoom.active then
-                -- If zoom was active, gradually reapply zoom to the new scene
-                local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
-                local start_crop = {left = 0, top = 0, right = 0, bottom = 0}
-                local end_crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
-                local start_time = obs.os_gettime_ns() / 1000000
-                
-                local transition_timer = nil
-                transition_timer = obs.timer_add(function()
-                    -- CRITICAL: Check if app_state exists (prevents crash if script is unloaded)
-                    if not app_state then
-                        if transition_timer then
-                            obs.timer_remove(transition_timer)
-                        end
-                        return
-                    end
-                    
-                    local current_time = obs.os_gettime_ns() / 1000000
-                    local progress = math.min((current_time - start_time) / app_state.scene_transition_duration, 1.0)
-                    
-                    local new_crop = {
-                        left = start_crop.left + (end_crop.left - start_crop.left) * progress,
-                        top = start_crop.top + (end_crop.top - start_crop.top) * progress,
-                        right = start_crop.right + (end_crop.right - start_crop.right) * progress,
-                        bottom = start_crop.bottom + (end_crop.bottom - start_crop.bottom) * progress
-                    }
-                    
-                    update_crop(new_crop.left, new_crop.top, new_crop.right, new_crop.bottom)
-                    
-                    if progress >= 1.0 then
-                        if transition_timer then
-                            obs.timer_remove(transition_timer)
-                        end
-                    end
-                end, app_state.update_interval)
+                -- Capture dimensions before they go to 0 after filter_add
+                local sw = obs.obs_source_get_width(app_state.source)
+                local sh = obs.obs_source_get_height(app_state.source)
+                if sw > 0 and sh > 0 then
+                    app_state._src_dims = {w = sw, h = sh}
+                end
+                local dims = app_state._src_dims
+                if dims then
+                    local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
+                    local target_crop = calc_zoom_crop(mouse_x, mouse_y, app_state.zoom.current, dims.w, dims.h)
+                    update_crop(target_crop.left, target_crop.top, target_crop.right, target_crop.bottom)
+                    app_state.last_crop = copy_crop(target_crop)
+                    app_state.current_crop = target_crop
+                    app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
+                end
+                if app_state.follow.active then
+                    ensure_zoom_timer()
+                end
             else
                 -- If zoom wasn't active, ensure the filter is set without zoom
                 update_crop(0, 0, 0, 0)
@@ -1552,10 +1273,8 @@ local function on_scene_change()
             -- If no valid source is found, deactivate zoom
             app_state.zoom.active = false
             app_state.follow.active = false
-            if app_state.animation_timer then
-                obs.timer_remove(animate_zoom)
-                app_state.animation_timer = nil
-            end
+            stop_zoom_timer()
+            zoom_state = "idle"
             log("warning", "Zoom deactivated: no valid video source in the new scene")
         end
     end
@@ -1572,18 +1291,11 @@ end
 -- Validate settings
 local function validate_settings(settings)
     local zoom_val = obs.obs_data_get_double(settings, "zoom_value")
-    local zoom_spd = obs.obs_data_get_double(settings, "zoom_speed")
     local follow_spd = obs.obs_data_get_double(settings, "follow_speed")
     
-    -- Clamp values to valid ranges
-    if zoom_val < 1.1 or zoom_val > 5.0 then
+    if zoom_val < 1.1 or zoom_val > MAX_ZOOM_VALUE then
         log("warning", "Zoom value out of range, clamping to valid range")
-        obs.obs_data_set_double(settings, "zoom_value", math.max(1.1, math.min(5.0, zoom_val)))
-    end
-    
-    if zoom_spd < 0.01 or zoom_spd > 1.0 then
-        log("warning", "Zoom speed out of range, clamping to valid range")
-        obs.obs_data_set_double(settings, "zoom_speed", math.max(0.01, math.min(1.0, zoom_spd)))
+        obs.obs_data_set_double(settings, "zoom_value", math.max(1.1, math.min(MAX_ZOOM_VALUE, zoom_val)))
     end
     
     if follow_spd < 0.01 or follow_spd > 1.0 then
@@ -1602,19 +1314,10 @@ local function cleanup_all_resources()
     if app_state then
         app_state.cleanup_in_progress = true
         
-        -- Remove animation timer
-        if app_state.animation_timer then
-            obs.timer_remove(animate_zoom)
-            app_state.animation_timer = nil
-            log("info", "Animation timer removed during cleanup")
-        end
-        
-        -- Remove zoom out timer
-        if app_state.zoom_out_timer then
-            obs.timer_remove(app_state.zoom_out_timer)
-            app_state.zoom_out_timer = nil
-            log("info", "Zoom out timer removed during cleanup")
-        end
+        -- Remove zoom tick timer
+        stop_zoom_timer()
+        zoom_state = "idle"
+        log("info", "Zoom timer removed during cleanup")
     end
     
     -- Remove crop filter (protected with pcall to prevent crashes)
@@ -1660,16 +1363,17 @@ end
 
 -- Script description
 function script_description()
-    return "Zoom and follow mouse for OBS Studio. Supports multi-monitor setups. Version 2.0.0 (Refactored 2025)"
+    return "Zoom and follow mouse for OBS Studio. Supports multi-monitor setups. Version 2.1.0 (Refactored 2025)"
 end
 
 -- Script properties
 function script_properties()
     local props = obs.obs_properties_create()
     
-    -- Main zoom settings
-    obs.obs_properties_add_float_slider(props, "zoom_value", "Zoom Value", 1.1, 5.0, 0.1)
-    obs.obs_properties_add_float_slider(props, "zoom_speed", "Zoom Speed", 0.01, 1.0, 0.01)
+    -- Main settings
+    obs.obs_properties_add_float_slider(props, "zoom_value", "Zoom Value", 1.1, MAX_ZOOM_VALUE, 0.1)
+    obs.obs_properties_add_int(props, "zoom_animation_duration", "Zoom In Duration (ms)", 1, 60000, 1)
+    obs.obs_properties_add_int(props, "zoom_out_duration", "Zoom Out Duration (ms)", 1, 60000, 1)
     obs.obs_properties_add_float_slider(props, "follow_speed", "Follow Speed", 0.01, 1.0, 0.01)
     
     -- Advanced settings group
@@ -1678,8 +1382,6 @@ function script_properties()
     obs.obs_properties_add_int(advanced_group, "mouse_deadzone", "Mouse Deadzone (pixels)", 1, 10, 1)
     obs.obs_properties_add_int(advanced_group, "crop_update_threshold", "Crop Update Threshold (pixels)", 1, 10, 1)
     obs.obs_properties_add_int(advanced_group, "crop_edge_threshold", "Crop Edge Threshold (pixels)", 1, 20, 1)
-    obs.obs_properties_add_int(advanced_group, "zoom_animation_duration", "Zoom In Duration (ms)", 100, 1000, 50)
-    obs.obs_properties_add_int(advanced_group, "zoom_out_duration", "Zoom Out Duration (ms)", 100, 1000, 50)
     obs.obs_properties_add_int(advanced_group, "scene_transition_duration", "Scene Transition Duration (ms)", 100, 1000, 50)
     obs.obs_properties_add_int(advanced_group, "mouse_cache_duration", "Mouse Cache Duration (ms)", 4, 32, 1)
     obs.obs_properties_add_int(advanced_group, "default_monitor_width", "Default Monitor Width", 640, 7680, 1)
@@ -1695,8 +1397,9 @@ end
 -- Default values
 function script_defaults(settings)
     obs.obs_data_set_default_double(settings, "zoom_value", 2.0)
-    obs.obs_data_set_default_double(settings, "zoom_speed", 0.1)
-    obs.obs_data_set_default_double(settings, "follow_speed", 0.1)
+    obs.obs_data_set_default_int(settings, "zoom_animation_duration", DEFAULT_ZOOM_ANIMATION_DURATION)
+    obs.obs_data_set_default_int(settings, "zoom_out_duration", DEFAULT_ZOOM_OUT_DURATION)
+    obs.obs_data_set_default_double(settings, "follow_speed", 1.0)
     obs.obs_data_set_default_bool(settings, "debug_mode", false)
     
     -- Advanced settings defaults
@@ -1704,8 +1407,6 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "mouse_deadzone", DEFAULT_MOUSE_DEADZONE)
     obs.obs_data_set_default_int(settings, "crop_update_threshold", DEFAULT_CROP_UPDATE_THRESHOLD)
     obs.obs_data_set_default_int(settings, "crop_edge_threshold", DEFAULT_CROP_EDGE_THRESHOLD)
-    obs.obs_data_set_default_int(settings, "zoom_animation_duration", DEFAULT_ZOOM_ANIMATION_DURATION)
-    obs.obs_data_set_default_int(settings, "zoom_out_duration", DEFAULT_ZOOM_OUT_DURATION)
     obs.obs_data_set_default_int(settings, "scene_transition_duration", DEFAULT_SCENE_TRANSITION_DURATION)
     obs.obs_data_set_default_int(settings, "mouse_cache_duration", DEFAULT_MOUSE_CACHE_DURATION)
     obs.obs_data_set_default_int(settings, "default_monitor_width", DEFAULT_MONITOR_WIDTH)
@@ -1719,7 +1420,8 @@ function script_update(settings)
     
     -- Update main state with validated settings
     app_state.zoom.value = obs.obs_data_get_double(settings, "zoom_value")
-    app_state.zoom.speed = obs.obs_data_get_double(settings, "zoom_speed")
+    app_state.zoom_animation_duration = obs.obs_data_get_int(settings, "zoom_animation_duration") or DEFAULT_ZOOM_ANIMATION_DURATION
+    app_state.zoom_out_duration = obs.obs_data_get_int(settings, "zoom_out_duration") or DEFAULT_ZOOM_OUT_DURATION
     app_state.follow.speed = obs.obs_data_get_double(settings, "follow_speed")
     app_state.debug_mode = obs.obs_data_get_bool(settings, "debug_mode")
     
@@ -1728,8 +1430,6 @@ function script_update(settings)
     app_state.mouse_deadzone = obs.obs_data_get_int(settings, "mouse_deadzone") or DEFAULT_MOUSE_DEADZONE
     app_state.crop_update_threshold = obs.obs_data_get_int(settings, "crop_update_threshold") or DEFAULT_CROP_UPDATE_THRESHOLD
     app_state.crop_edge_threshold = obs.obs_data_get_int(settings, "crop_edge_threshold") or DEFAULT_CROP_EDGE_THRESHOLD
-    app_state.zoom_animation_duration = obs.obs_data_get_int(settings, "zoom_animation_duration") or DEFAULT_ZOOM_ANIMATION_DURATION
-    app_state.zoom_out_duration = obs.obs_data_get_int(settings, "zoom_out_duration") or DEFAULT_ZOOM_OUT_DURATION
     app_state.scene_transition_duration = obs.obs_data_get_int(settings, "scene_transition_duration") or DEFAULT_SCENE_TRANSITION_DURATION
     app_state.mouse_cache_duration = obs.obs_data_get_int(settings, "mouse_cache_duration") or DEFAULT_MOUSE_CACHE_DURATION
     app_state.default_monitor_width = obs.obs_data_get_int(settings, "default_monitor_width") or DEFAULT_MONITOR_WIDTH
@@ -1802,15 +1502,9 @@ function script_unload()
     -- CRITICAL: Ensure all timers are stopped and filters removed before cleanup
     -- This prevents any operations on sources/scenes after script is unloaded
     if app_state then
-        -- Stop all timers immediately
-        if app_state.animation_timer then
-            pcall(function() obs.timer_remove(animate_zoom) end)
-            app_state.animation_timer = nil
-        end
-        if app_state.zoom_out_timer then
-            pcall(function() obs.timer_remove(app_state.zoom_out_timer) end)
-            app_state.zoom_out_timer = nil
-        end
+        -- Stop zoom timer
+        pcall(stop_zoom_timer)
+        zoom_state = "idle"
         
         -- Remove filter but DO NOT release source references
         -- Sources are managed by OBS, we should never release them
