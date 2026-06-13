@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.0] - 2026
+
+### Robust source detection (fixes #9, #10, #14)
+
+- **Capability-based detection**: the script now accepts **any source that produces video** (checked via `obs_source_get_output_flags` / `OBS_SOURCE_VIDEO`) instead of matching a hard-coded list of source-type IDs. This fixes "No valid video source found" across platforms and OBS versions — macOS Display/Screen Capture, Linux PipeWire (Wayland) including the current `pipewire-screen-capture-source` ID, XSHM, Xcomposite, and any future capture type. The old ID list is kept only as a ranking hint and as a fallback for very old OBS builds.
+
+### Nested scenes & groups (fixes the nested-scene reports / forum request)
+
+- **Group traversal**: detection now descends into OBS **groups** as well as nested scenes, drilling down to the original capture source in the lowest layer. Previously a capture inside a group was invisible and produced "No valid video source found".
+- **Preferred Source (optional)**: a new setting lets you pin which source to zoom by name — useful when a scene contains several captures or deeply nested layers.
+
+### Mouse tracking (fixes #8 "Not tracking")
+
+- **HiDPI / Retina fix**: mouse-to-source mapping is now normalized to the monitor the cursor is on, then scaled to the source's pixel size. On high-DPI displays (e.g. macOS Retina 2×, Windows display scaling) the viewport now follows the cursor correctly instead of being confined to a corner. On native (non-scaled) setups the math is unchanged.
+- **Auto-follow while zoomed (opt-in, default OFF)**: a new option makes the viewport track the mouse as soon as you zoom in, without a separate hotkey. The Follow hotkey still works as a live freeze/unfreeze toggle. Default OFF, so existing setups behave exactly as before.
+
+### Reliability
+
+- **Safer source dimensions**: when the rendered source size is momentarily unavailable (`0`, e.g. right after the crop filter is added) the script falls back to the source's native resolution instead of failing to zoom.
+
+### Notes
+
+- **Installation (#19)**: if OBS reports `unexpected symbol near '<'`, the `.lua` was saved as the GitHub HTML page. Download from **Releases** or the **Raw** link — see the README.
+
 ## [2.1.0] - 2025
 
 ### Rewritten zoom and follow engine

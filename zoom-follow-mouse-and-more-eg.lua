@@ -1,10 +1,14 @@
 -- ============================================================================
 -- Zoom, Follow Mouse and MORE for OBS Studio
--- Version 2.1.0 (Refactored 2025)
+-- Version 2.2.0 (2026)
 -- ============================================================================
 
 local obs = obslua
 local ffi = require("ffi")
+-- LuaJIT bitwise library, used for capability-based source detection.
+-- Guarded: if unavailable we fall back to a manual single-bit test (see has_flag).
+local ok_bit, bit = pcall(require, "bit")
+if not ok_bit then bit = nil end
 
 -- ============================================================================
 -- CONSTANTS
@@ -28,7 +32,13 @@ local MAX_ZOOM_VALUE = 100.0 -- Maximum zoom multiplier; practical limit depends
 local DEFAULT_MONITOR_WIDTH = 1920
 local DEFAULT_MONITOR_HEIGHT = 1080
 
--- Valid video source types
+-- Known "capture" source ids.
+-- NOTE: Since v2.2.0 source detection is CAPABILITY-BASED (see source_produces_video):
+-- any source flagged OBS_SOURCE_VIDEO is accepted, regardless of its id. This list is
+-- now only a RANKING HINT — when a scene contains several video sources (e.g. a logo
+-- image plus a screen capture) the script prefers a "known capture" over a generic
+-- video source. It is also the fallback allowlist on very old OBS builds where the
+-- capability flags are not exposed.
 local VALID_SOURCE_TYPES = {
     "ffmpeg_source",
     "browser_source",
@@ -42,7 +52,9 @@ local VALID_SOURCE_TYPES = {
     "display_capture",   -- Display Capture (legacy)
     "screen_capture",    -- macOS Screen Capture (ScreenCaptureKit)
     -- Linux (Wayland/PipeWire + linux-capture)
-    "pipewire-desktop-capture-source",  -- Screen/Window Capture (PipeWire)
+    "pipewire-screen-capture-source",   -- Screen Capture (PipeWire) — current id
+    "pipewire-window-capture-source",   -- Window Capture (PipeWire) — current id
+    "pipewire-desktop-capture-source",  -- Screen/Window Capture (PipeWire) — legacy/obsolete id
     "xshm_input",        -- Screen capture X11 (XSHM)
     "xshm_input_v2",     -- Screen capture X11 v2
     "xcomposite_input"   -- Window Capture (Xcomposite)
@@ -407,10 +419,13 @@ local app_state = {
     },
     follow = {
         active = false,
+        auto = false, -- "Auto-follow while zoomed" option (opt-in, default OFF)
         speed = 0.2
     },
     source = nil,
     source_scene_item = nil, -- Scene item reference for getting transformations
+    source_is_nested = false, -- True when the chosen source was reached via a nested scene/group
+    preferred_source_name = "", -- Optional: name of the source to prefer (empty = automatic)
     crop_filter = nil,
     crop_filter_owned = false, -- Track if filter was created by us (needs release) or borrowed (no release)
     original_crop = nil,
@@ -461,6 +476,7 @@ local function reset_state()
     app_state.current_crop = nil
     app_state.target_crop = nil
     app_state.source_scene_item = nil
+    app_state.source_is_nested = false
 end
 
 -- ============================================================================
@@ -485,13 +501,25 @@ local function log(level, message)
     end
 end
 
--- Check if source type is valid
-local function is_valid_source_type(source)
-    if not source then
+-- Test a capability bit in an output-flags value.
+-- Uses the LuaJIT bit library when available. The no-bit-library fallback is only
+-- valid for a SINGLE-BIT mask — which is all we pass here (OBS_SOURCE_VIDEO == 1<<0).
+local function has_flag(flags, mask)
+    if not flags or not mask or mask == 0 then
         return false
     end
-    
-    local source_id = obs.obs_source_get_id(source)
+    if bit then
+        return bit.band(flags, mask) ~= 0
+    end
+    -- Fallback without the bit library (single-bit mask only)
+    return (math.floor(flags / mask) % 2) == 1
+end
+
+-- Is this a "known capture" source id? Used only as a ranking hint / legacy fallback.
+local function is_known_capture_type(source_id)
+    if not source_id then
+        return false
+    end
     for _, valid_type in ipairs(VALID_SOURCE_TYPES) do
         if source_id == valid_type then
             return true
@@ -500,71 +528,171 @@ local function is_valid_source_type(source)
     return false
 end
 
--- Find valid video source in current scene (recursive)
+-- Capability-based check: does this source PRODUCE VIDEO?
+-- Robust across OS / OBS version / locale because it does not depend on the
+-- source id string. Scenes and groups are intentionally rejected here (the
+-- traversal in find_valid_video_source recurses into them). Falls back to the
+-- legacy id allowlist on very old OBS builds that do not expose the flags.
+local function source_produces_video(source)
+    if not source then
+        return false
+    end
+
+    -- Only plain inputs are zoom targets; scenes/groups are handled by recursion.
+    if obs.obs_source_get_type(source) ~= obs.OBS_SOURCE_TYPE_INPUT then
+        return false
+    end
+
+    local source_id = obs.obs_source_get_id(source) or ""
+    -- Never target our own crop filter or a generic filter source.
+    if source_id == "crop_filter" or source_id == CROP_FILTER_NAME then
+        return false
+    end
+
+    -- Primary path: capability flags.
+    if obs.OBS_SOURCE_VIDEO ~= nil then
+        local flags = nil
+        pcall(function()
+            flags = obs.obs_source_get_output_flags(source)
+        end)
+        if flags then
+            -- OBS_SOURCE_VIDEO (bit 0) is set for BOTH sync and async video sources
+            -- (OBS_SOURCE_ASYNC_VIDEO = OBS_SOURCE_ASYNC | OBS_SOURCE_VIDEO), so this
+            -- single test already covers every video-producing source.
+            if has_flag(flags, obs.OBS_SOURCE_VIDEO) then
+                return true
+            end
+            -- Flags available but no video bit -> definitely not a video source.
+            return false
+        end
+    end
+
+    -- Fallback for old OBS builds without the capability flags: legacy allowlist.
+    return is_known_capture_type(source_id)
+end
+
+-- Find a valid video source in the current scene.
+--
+-- Walks the scene graph depth-first, descending into BOTH nested scenes AND
+-- groups (groups are not scenes: obs_scene_from_source returns nil for them, so
+-- they need obs_group_from_source — this is what made captures inside groups
+-- invisible before). Every video-producing leaf is collected as a candidate,
+-- then one is chosen by priority:
+--   1. the source whose name matches "Preferred Source" (if set),
+--   2. the first "known capture" (so a logo/overlay is never picked over a
+--      real screen capture),
+--   3. otherwise the first video source found (depth-first / lowest layer).
+-- This satisfies the "pick the original source from the lowest scene layer"
+-- request while keeping the previous behaviour for simple scenes intact.
 local function find_valid_video_source()
     local current_scene = obs.obs_frontend_get_current_scene()
     if not current_scene then
         log("info", "No current scene found")
         return nil
     end
-    
+
     local scene = obs.obs_scene_from_source(current_scene)
-    local items = obs.obs_scene_enum_items(scene)
-    
-    local function check_source(source)
-        if not source then
-            return nil
+    local candidates = {}   -- { source, scene_item, known, nested }
+    local visited = {}      -- guard against scene/group cycles (keyed by name)
+
+    -- Recursively walk a list of scene items, collecting video leaves.
+    local function walk(items, nested)
+        if not items then
+            return
         end
-        
-        if is_valid_source_type(source) then
-            return source
-        elseif obs.obs_source_get_type(source) == obs.OBS_SOURCE_TYPE_SCENE then
-            -- Recursively search in nested scenes
-            local nested_scene = obs.obs_scene_from_source(source)
-            if nested_scene then
-                local nested_items = obs.obs_scene_enum_items(nested_scene)
-                for _, nested_item in ipairs(nested_items) do
-                    local nested_source = obs.obs_sceneitem_get_source(nested_item)
-                    local valid_source = check_source(nested_source)
-                    if valid_source then
-                        obs.sceneitem_list_release(nested_items)
-                        return valid_source
+        for _, item in ipairs(items) do
+            local src = obs.obs_sceneitem_get_source(item)
+            if src then
+                local is_group = obs.obs_sceneitem_is_group ~= nil
+                    and obs.obs_sceneitem_is_group(item)
+
+                if is_group then
+                    -- GROUP: enumerate via obs_group_from_source (NOT obs_scene_from_source)
+                    local gname = obs.obs_source_get_name(src) or ""
+                    if not visited[gname] then
+                        visited[gname] = true
+                        local gscene = nil
+                        pcall(function()
+                            gscene = obs.obs_group_from_source(src)
+                        end)
+                        if gscene then
+                            local gitems = obs.obs_scene_enum_items(gscene)
+                            walk(gitems, true)
+                            obs.sceneitem_list_release(gitems)
+                        end
                     end
+                elseif obs.obs_source_get_type(src) == obs.OBS_SOURCE_TYPE_SCENE then
+                    -- NESTED SCENE
+                    local sname = obs.obs_source_get_name(src) or ""
+                    if not visited[sname] then
+                        visited[sname] = true
+                        local nested_scene = obs.obs_scene_from_source(src)
+                        if nested_scene then
+                            local nested_items = obs.obs_scene_enum_items(nested_scene)
+                            walk(nested_items, true)
+                            obs.sceneitem_list_release(nested_items)
+                        end
+                    end
+                elseif source_produces_video(src) then
+                    -- VIDEO LEAF
+                    table.insert(candidates, {
+                        source = src,
+                        scene_item = item,
+                        known = is_known_capture_type(obs.obs_source_get_id(src) or ""),
+                        nested = nested
+                    })
                 end
-                obs.sceneitem_list_release(nested_items)
             end
         end
-        return nil
     end
-    
-    local valid_source = nil
-    local valid_scene_item = nil
-    for _, item in ipairs(items) do
-        local item_source = obs.obs_sceneitem_get_source(item)
-        valid_source = check_source(item_source)
-        if valid_source then
-            valid_scene_item = item
-            break
-        end
-    end
-    
+
+    local items = obs.obs_scene_enum_items(scene)
+    walk(items, false)
     obs.sceneitem_list_release(items)
     -- Release scene (protected with pcall)
     pcall(function()
         obs.obs_source_release(current_scene)
     end)
-    
-    if valid_source then
-        -- Note: Sources from scene items are managed by OBS, no need to addref/release
-        log("info", "Found valid video source: " .. obs.obs_source_get_name(valid_source))
-        -- Store scene item reference for getting transformations
-        app_state.source_scene_item = valid_scene_item
-    else
-        log("info", "No valid video source found in the current scene")
-        app_state.source_scene_item = nil
+
+    -- Selection: preferred name > known capture > first video leaf.
+    local chosen = nil
+    local pref = app_state.preferred_source_name
+    if pref and pref ~= "" then
+        for _, c in ipairs(candidates) do
+            if obs.obs_source_get_name(c.source) == pref then
+                chosen = c
+                break
+            end
+        end
+        if not chosen then
+            log("warning", "Preferred source '" .. pref .. "' not found in scene; using automatic selection")
+        end
     end
-    
-    return valid_source
+    if not chosen then
+        for _, c in ipairs(candidates) do
+            if c.known then
+                chosen = c
+                break
+            end
+        end
+    end
+    if not chosen and #candidates > 0 then
+        chosen = candidates[1]
+    end
+
+    if chosen then
+        -- Note: sources from scene items are managed by OBS, no addref/release needed.
+        app_state.source_scene_item = chosen.scene_item
+        app_state.source_is_nested = chosen.nested
+        log("info", "Found valid video source: " .. (obs.obs_source_get_name(chosen.source) or "?")
+            .. (chosen.nested and " (nested)" or ""))
+        return chosen.source
+    end
+
+    log("info", "No valid video source found in the current scene")
+    app_state.source_scene_item = nil
+    app_state.source_is_nested = false
+    return nil
 end
 
 -- ============================================================================
@@ -614,6 +742,31 @@ end
 -- ============================================================================
 -- CROP & FILTER MANAGEMENT
 -- ============================================================================
+
+-- Get a source's pixel dimensions reliably.
+-- Uses the rendered width/height first (same reference resolution the crop filter
+-- operates on, and identical to v2.1.0), and falls back to the native base size
+-- only when the rendered size is momentarily 0 (e.g. right after filter_add).
+-- Returns 0,0 on failure.
+local function get_source_dimensions(source)
+    if not source then
+        return 0, 0
+    end
+    local w, h = 0, 0
+    pcall(function()
+        w = obs.obs_source_get_width(source)
+        h = obs.obs_source_get_height(source)
+    end)
+    if not w or w <= 0 or not h or h <= 0 then
+        pcall(function()
+            if obs.obs_source_get_base_width then
+                w = obs.obs_source_get_base_width(source)
+                h = obs.obs_source_get_base_height(source)
+            end
+        end)
+    end
+    return w or 0, h or 0
+end
 
 -- Validate source has valid dimensions
 local function validate_source_dimensions(source)
@@ -803,6 +956,57 @@ local function copy_crop(c)
     return {left = c.left, top = c.top, right = c.right, bottom = c.bottom}
 end
 
+-- Return the monitor rectangle the screen-space point (x, y) is on.
+-- Falls back to the first detected monitor, then to the configured default size.
+local function monitor_at(x, y)
+    local fallback = app_state.monitors[1] or {
+        left = 0, top = 0,
+        right = app_state.default_monitor_width,
+        bottom = app_state.default_monitor_height
+    }
+    for _, m in ipairs(app_state.monitors) do
+        if x >= m.left and x < m.right and y >= m.top and y < m.bottom then
+            return m
+        end
+    end
+    return fallback
+end
+
+-- Map a screen-space mouse position to SOURCE PIXEL coordinates.
+--
+-- Cases:
+--  * monitor size == source size (the common Windows/Linux native, non-scaled
+--    case): returns the EXACT integer translation (mouse - origin) — byte-for-byte
+--    identical to v2.1.0, no float division.
+--  * monitor size != source size (macOS Retina 2x, Windows display scaling, or a
+--    source whose resolution differs from the monitor): scales the cursor's
+--    position from monitor space into source pixels. This is the fix for issue #8
+--    ("centers but won't follow") and is HiDPI-safe.
+--  * cursor outside the monitor: recenters on the source middle (as v2.1.0 did).
+local function map_mouse_to_source(mouse_x, mouse_y, monitor, src_w, src_h)
+    local mon_w = monitor.right - monitor.left
+    local mon_h = monitor.bottom - monitor.top
+    if mon_w <= 0 or mon_h <= 0 then
+        return src_w / 2, src_h / 2
+    end
+
+    local rel_x = mouse_x - monitor.left
+    local rel_y = mouse_y - monitor.top
+
+    -- Cursor outside this monitor -> recenter to source middle (v2.1.0 behaviour).
+    if rel_x < 0 or rel_x > mon_w or rel_y < 0 or rel_y > mon_h then
+        return src_w / 2, src_h / 2
+    end
+
+    -- Fast path: identical pixel sizes -> exact translation, no rounding.
+    if mon_w == src_w and mon_h == src_h then
+        return rel_x, rel_y
+    end
+
+    -- Scaled mapping: defer the divide to minimize floating-point error.
+    return rel_x * src_w / mon_w, rel_y * src_h / mon_h
+end
+
 -- Single named tick: handles zooming_in, zooming_out, and follow
 local function on_zoom_tick()
     if not app_state then return end
@@ -913,24 +1117,9 @@ local function on_zoom_tick()
         local cur_cx = cur.left + view_w / 2
         local cur_cy = cur.top  + view_h / 2
 
-        -- Find the monitor the mouse is on
-        local monitor = app_state.monitors[1] or {
-            left = 0, top = 0, right = src_w, bottom = src_h
-        }
-        for _, m in ipairs(app_state.monitors) do
-            if mx >= m.left and mx < m.right and my >= m.top and my < m.bottom then
-                monitor = m
-                break
-            end
-        end
-
-        -- Target center = mouse position in source coords
-        local tgt_cx = mx - monitor.left
-        local tgt_cy = my - monitor.top
-        if tgt_cx < 0 or tgt_cx > src_w or tgt_cy < 0 or tgt_cy > src_h then
-            tgt_cx = src_w / 2
-            tgt_cy = src_h / 2
-        end
+        -- Target center = mouse position mapped into source pixel coords (HiDPI-safe)
+        local monitor = monitor_at(mx, my)
+        local tgt_cx, tgt_cy = map_mouse_to_source(mx, my, monitor, src_w, src_h)
 
         -- Smoothly move center toward target
         local spd = app_state.follow.speed
@@ -972,32 +1161,14 @@ end
 
 -- Pure crop math from known dimensions. Does NOT query OBS for source size
 -- (after filter_add, obs_source_get_width returns 0 for ~1 frame).
+-- Uses the shared monitor_at() / map_mouse_to_source() helpers (defined earlier).
 local function calc_zoom_crop(mouse_x, mouse_y, zoom_level, src_w, src_h)
     if src_w <= 0 or src_h <= 0 or zoom_level <= 1.0 then
         return {left = 0, top = 0, right = 0, bottom = 0}
     end
 
-    -- Find the monitor the mouse is on
-    local monitor = app_state.monitors[1] or {
-        left = 0, top = 0,
-        right = app_state.default_monitor_width,
-        bottom = app_state.default_monitor_height
-    }
-    for _, m in ipairs(app_state.monitors) do
-        if mouse_x >= m.left and mouse_x < m.right and
-           mouse_y >= m.top and mouse_y < m.bottom then
-            monitor = m
-            break
-        end
-    end
-
-    local mx_src = mouse_x - monitor.left
-    local my_src = mouse_y - monitor.top
-
-    if mx_src < 0 or mx_src > src_w or my_src < 0 or my_src > src_h then
-        mx_src = src_w / 2
-        my_src = src_h / 2
-    end
+    local monitor = monitor_at(mouse_x, mouse_y)
+    local mx_src, my_src = map_mouse_to_source(mouse_x, mouse_y, monitor, src_w, src_h)
 
     local view_w = math.max(4, math.min(math.floor(src_w / zoom_level), src_w))
     local view_h = math.max(4, math.min(math.floor(src_h / zoom_level), src_h))
@@ -1025,10 +1196,7 @@ local function start_zoom_in(src_w, src_h)
         src_h = app_state._src_dims.h
     end
     if (not src_w or src_w <= 0) then
-        pcall(function()
-            src_w = obs.obs_source_get_width(app_state.source)
-            src_h = obs.obs_source_get_height(app_state.source)
-        end)
+        src_w, src_h = get_source_dimensions(app_state.source)
     end
     if not src_w or src_w <= 0 or not src_h or src_h <= 0 then
         log("error", "Cannot start zoom in: no valid dimensions")
@@ -1054,6 +1222,13 @@ local function start_zoom_in(src_w, src_h)
     zoom_state = "zooming_in"
     app_state.zoom.active = true
     app_state.zoom.target = app_state.zoom.value
+    -- Opt-in auto-follow (default OFF): start tracking immediately so the viewport
+    -- follows the mouse without a second hotkey. Keeping follow.active true also
+    -- keeps the tick timer alive past the zoom-in completion (see on_zoom_tick).
+    -- The Follow hotkey still works as a live freeze/unfreeze toggle.
+    if app_state.follow.auto then
+        app_state.follow.active = true
+    end
     app_state.last_mouse_pos = {x = mx, y = my}
     ensure_zoom_timer()
     log("info", string.format("Zoom in: crop [%d,%d,%d,%d] -> [%d,%d,%d,%d] over %d ms",
@@ -1157,8 +1332,7 @@ local function on_zoom_hotkey(pressed)
         end
         
         -- Capture dimensions BEFORE applying filter (after filter_add, get_width returns 0)
-        local pre_w = obs.obs_source_get_width(app_state.source)
-        local pre_h = obs.obs_source_get_height(app_state.source)
+        local pre_w, pre_h = get_source_dimensions(app_state.source)
         
         app_state.zoom.current = 1.0
         app_state.follow.active = false
@@ -1248,8 +1422,7 @@ local function on_scene_change()
             
             if app_state.zoom.active then
                 -- Capture dimensions before they go to 0 after filter_add
-                local sw = obs.obs_source_get_width(app_state.source)
-                local sh = obs.obs_source_get_height(app_state.source)
+                local sw, sh = get_source_dimensions(app_state.source)
                 if sw > 0 and sh > 0 then
                     app_state._src_dims = {w = sw, h = sh}
                 end
@@ -1363,7 +1536,7 @@ end
 
 -- Script description
 function script_description()
-    return "Zoom and follow mouse for OBS Studio. Supports multi-monitor setups. Version 2.1.0 (Refactored 2025)"
+    return "Zoom and follow mouse for OBS Studio. Capability-based source detection (works with any video source, nested scenes and groups), HiDPI-aware tracking, multi-monitor support. Version 2.2.0"
 end
 
 -- Script properties
@@ -1375,7 +1548,29 @@ function script_properties()
     obs.obs_properties_add_int(props, "zoom_animation_duration", "Zoom In Duration (ms)", 1, 60000, 1)
     obs.obs_properties_add_int(props, "zoom_out_duration", "Zoom Out Duration (ms)", 1, 60000, 1)
     obs.obs_properties_add_float_slider(props, "follow_speed", "Follow Speed", 0.01, 1.0, 0.01)
-    
+
+    -- Auto-follow: when ON, the viewport tracks the mouse as soon as you zoom in,
+    -- without pressing the Follow hotkey. Default OFF (no change for existing users).
+    obs.obs_properties_add_bool(props, "auto_follow", "Auto-follow while zoomed (no separate hotkey)")
+
+    -- Optional: prefer a specific source by name. Useful with nested scenes / groups
+    -- or when a scene has several captures. Empty = automatic (first capture found).
+    local src_list = obs.obs_properties_add_list(props, "preferred_source_name",
+        "Preferred Source (optional)", obs.OBS_COMBO_TYPE_EDITABLE, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(src_list, "(automatic — first capture found)", "")
+    local all_sources = obs.obs_enum_sources()
+    if all_sources then
+        for _, src in ipairs(all_sources) do
+            if source_produces_video(src) then
+                local name = obs.obs_source_get_name(src)
+                if name then
+                    obs.obs_property_list_add_string(src_list, name, name)
+                end
+            end
+        end
+        obs.source_list_release(all_sources)
+    end
+
     -- Advanced settings group
     local advanced_group = obs.obs_properties_create()
     obs.obs_properties_add_int(advanced_group, "update_interval", "Update Interval (ms)", 8, 100, 1)
@@ -1400,6 +1595,8 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "zoom_animation_duration", DEFAULT_ZOOM_ANIMATION_DURATION)
     obs.obs_data_set_default_int(settings, "zoom_out_duration", DEFAULT_ZOOM_OUT_DURATION)
     obs.obs_data_set_default_double(settings, "follow_speed", 1.0)
+    obs.obs_data_set_default_bool(settings, "auto_follow", false)
+    obs.obs_data_set_default_string(settings, "preferred_source_name", "")
     obs.obs_data_set_default_bool(settings, "debug_mode", false)
     
     -- Advanced settings defaults
@@ -1423,6 +1620,8 @@ function script_update(settings)
     app_state.zoom_animation_duration = obs.obs_data_get_int(settings, "zoom_animation_duration") or DEFAULT_ZOOM_ANIMATION_DURATION
     app_state.zoom_out_duration = obs.obs_data_get_int(settings, "zoom_out_duration") or DEFAULT_ZOOM_OUT_DURATION
     app_state.follow.speed = obs.obs_data_get_double(settings, "follow_speed")
+    app_state.follow.auto = obs.obs_data_get_bool(settings, "auto_follow")
+    app_state.preferred_source_name = obs.obs_data_get_string(settings, "preferred_source_name") or ""
     app_state.debug_mode = obs.obs_data_get_bool(settings, "debug_mode")
     
     -- Update advanced configurable parameters
