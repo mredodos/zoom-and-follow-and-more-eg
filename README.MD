@@ -4,7 +4,7 @@
 
 **Dynamic zoom and mouse tracking for any video source in OBS.**
 
-![Version](https://img.shields.io/badge/version-2.1.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.2.0-blue?style=flat-square)
 ![OBS](https://img.shields.io/badge/OBS_Studio-30.0%2B-purple?style=flat-square)
 ![Lua](https://img.shields.io/badge/Lua-5.1%2B-blue?style=flat-square&logo=lua)
 ![License](https://img.shields.io/github/license/mredodos/zoom-and-follow-and-more-eg?style=flat-square&color=green)
@@ -27,10 +27,12 @@
 | Feature | Description |
 |---|---|
 | **Smooth Zoom** | Animated zoom-in/out with configurable duration (instant to cinematic) |
-| **Mouse Follow** | Viewport tracks the mouse with adjustable smoothing |
+| **Mouse Follow** | Viewport tracks the mouse with adjustable smoothing — via the Follow hotkey or the optional **Auto-follow** mode |
+| **Works with any source** | Capability-based detection: any video source is supported (screen/display/window/game capture, browser, media…) on every OS and OBS version |
+| **Nested scenes & groups** | Drills down to the original capture source inside nested scenes and groups; optional **Preferred Source** picker |
+| **HiDPI / Retina aware** | Correct tracking on high-DPI displays and scaled desktops, not just 1:1 monitors |
 | **Multi-Monitor** | Automatic monitor detection and correct coordinate mapping |
 | **Anti-Flicker** | Deadzone and threshold system eliminates visual jitter |
-| **Cross-Platform** | Windows, macOS, and Linux source types supported |
 | **Hotkey Driven** | Toggle zoom and follow independently via OBS hotkeys |
 | **Scene Aware** | Smooth transitions when switching scenes while zoomed |
 | **Debug Mode** | Detailed logging for troubleshooting |
@@ -39,8 +41,12 @@
 
 ### 1. Install
 
-1. Download **`zoom-follow-mouse-and-more-eg.lua`** from the repository
+1. Download **`zoom-follow-mouse-and-more-eg.lua`**. Use one of these so you get the *script*, not a web page:
+   - **Releases** (recommended): grab the `.lua` asset from the [latest release](https://github.com/mredodos/zoom-and-follow-and-more-eg/releases), **or**
+   - **Raw link**: open [the raw file](https://raw.githubusercontent.com/mredodos/zoom-and-follow-and-more-eg/main/zoom-follow-mouse-and-more-eg.lua) → right-click → **Save As…** (keep the `.lua` extension).
 2. In OBS: **Tools > Scripts > "+"** and select the file
+
+> ⚠️ **Don't** use *File → Save Page As* on the GitHub code viewer — that saves an HTML page and OBS will report `Error loading file: ... unexpected symbol near '<'`. Always use the Releases asset or the Raw link above.
 
 ### 2. Set Hotkeys
 
@@ -68,7 +74,11 @@ Press your zoom hotkey to zoom in at the mouse position. Press again to zoom out
 | **Zoom In Duration** | 1 – 60 000 ms | 300 ms | Animation length for zooming in. Set to `1` for instant. |
 | **Zoom Out Duration** | 1 – 60 000 ms | 500 ms | Animation length for zooming out. Set to `1` for instant. |
 | **Follow Speed** | 0.01 – 1.0 | 1.0 | How fast the viewport tracks the mouse. `1.0` = instant, `0.1` = smooth glide. |
+| **Auto-follow while zoomed** | on/off | **off** | When on, the viewport follows the mouse as soon as you zoom in — no separate hotkey needed. The Follow hotkey still works as a freeze/unfreeze toggle. |
+| **Preferred Source (optional)** | source name | *(automatic)* | Pin which source to zoom by name. Leave empty to auto-pick the first capture found (drilling into nested scenes and groups). |
 | **Debug Mode** | on/off | off | Enables detailed logging in OBS Script Logs. |
+
+> **Tip** — If you just want "zoom and it follows", turn on **Auto-follow while zoomed** and you can ignore the Follow hotkey entirely.
 
 > **Tip** — For tutorials and coding, use Follow Speed `1.0` (instant tracking). For presentations and gameplay, try `0.1–0.3` for a smooth camera feel.
 
@@ -108,12 +118,15 @@ Press your zoom hotkey to zoom in at the mouse position. Press again to zoom out
 
 | Problem | Solution |
 |---|---|
+| `Error loading file: ... unexpected symbol near '<'` | You saved the GitHub **HTML page** instead of the script. Re-download from **Releases** or the **Raw** link (see [Install](#1-install)). |
 | Zoom doesn't activate | Check source has valid dimensions. Press **Ctrl+F** on source first. |
+| Zoom centers but doesn't follow the mouse | Follow is a separate action: press the **Toggle Follow** hotkey, or enable **Auto-follow while zoomed** in settings. (On high-DPI/Retina displays tracking is fixed in 2.2.0.) |
 | Flickering at edges | Increase **Crop Edge Threshold** or **Mouse Deadzone** in Advanced Settings. |
 | Follow feels laggy | Lower **Update Interval** (e.g. 8 ms) and/or lower **Mouse Deadzone**. |
 | Mouse escapes viewport at high zoom | Normal at extreme zoom levels (tiny viewport). Lower Update Interval helps. |
 | Source appears to resize | Press **Ctrl+F** to fit source to screen before activating zoom. |
-| No valid video source | Ensure you have a capture source (Display, Window, Game) in the active scene. |
+| No valid video source | Ensure the active scene contains a video source. Captures inside **nested scenes and groups** are supported; if several captures exist, set a **Preferred Source**. |
+| Wrong source gets zoomed | Set **Preferred Source** to the exact source name you want. |
 
 > **Still stuck?** Enable **Debug Mode**, reproduce the issue, then check **Tools > Scripts > Script Logs**.
 
@@ -121,11 +134,16 @@ Press your zoom hotkey to zoom in at the mouse position. Press again to zoom out
 
 ## Supported Sources
 
-| Platform | Source types |
+Since **v2.2.0** the script detects sources by **capability** — *any* source that produces video can be zoomed, regardless of its internal type ID. It also drills into **nested scenes and groups** to find the original capture. The table below lists common, tested capture types per platform; it is not exhaustive.
+
+| Platform | Common capture types |
 |---|---|
 | **Windows** | Display Capture, Window Capture, Game Capture |
-| **macOS** | Display Capture, macOS Screen Capture |
-| **Linux** | Screen Capture (PipeWire), XSHM, Xcomposite |
+| **macOS** | Display Capture, macOS Screen Capture (ScreenCaptureKit) |
+| **Linux** | Screen/Window Capture (PipeWire / Wayland), XSHM, Xcomposite |
+| **Any** | Browser, Media/VLC, Image, and other video sources |
+
+> If a scene contains several video sources (e.g. a webcam overlay plus a screen capture), the script prefers a known *capture* source. Use **Preferred Source** to override the choice.
 
 ---
 
