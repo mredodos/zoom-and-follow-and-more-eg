@@ -172,10 +172,15 @@ local function detect_wayland_env()
     return nil
 end
 
--- Ground truth: a rootless XWayland server advertises the "XWAYLAND" X extension.
--- Its presence means the real desktop is Wayland, so the global cursor position
--- is not readable even though the X11 calls themselves appear to succeed.
--- A classic Xorg server does not advertise it.
+-- A rootless XWayland server advertises the "XWAYLAND" X extension; a classic
+-- Xorg server does not. Its presence means the real desktop is Wayland, so the
+-- global cursor position is not readable even though the X11 calls themselves
+-- appear to succeed. XQueryExtension is the officially recommended check.
+--
+-- The extension only exists since xorgproto 2022.2, so a "false" here is NOT
+-- proof of Xorg. That is why the environment hint is consulted first and this
+-- probe is only used to CONFIRM a Wayland session the env vars failed to reveal
+-- (e.g. inside a Flatpak sandbox).
 local function probe_xwayland(display)
     local found = false
     pcall(function()

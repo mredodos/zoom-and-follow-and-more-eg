@@ -12,7 +12,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added — honest Wayland handling
 
-- **Wayland is now detected reliably.** Environment variables (`XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`) are only a hint — they can be missing inside a Flatpak sandbox — so the script also probes the X server at runtime for the **`XWAYLAND` extension**, which a rootless XWayland server advertises and a classic Xorg server does not.
+- **Wayland is now detected reliably.** Environment variables (`XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`) are only a hint — they can be missing inside a Flatpak sandbox — so the script also probes the X server at runtime for the **`XWAYLAND` extension** (via `XQueryExtension`, the officially recommended check), which a rootless XWayland server advertises and a classic Xorg server does not. Since that extension only exists from `xorgproto 2022.2`, the environment hint is consulted first and the probe is used to *confirm* a session the env vars failed to reveal.
+- Monitor geometry needs `XRRGetMonitors` (libXrandr ≥ 1.5.0); on older systems the script now falls back to the default X screen size instead of failing.
 - Wayland deliberately provides **no protocol for an application to read the global cursor position**, so on Wayland the script now **zooms to the centre of the source and disables follow**, stating so clearly in the Script Log and in the script properties — instead of silently zooming into a corner. For mouse-centred zoom and follow, use an Xorg session (e.g. *GNOME on Xorg*).
 
 ### Fixed — diagnostics

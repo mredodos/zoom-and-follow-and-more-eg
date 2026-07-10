@@ -169,10 +169,11 @@ Since **v2.2.1** the script detects Wayland, says so in the Script Log and in th
 
 ### Hotkeys only work when OBS is focused (Wayland)
 
-This is an **OBS core limitation** on Wayland — OBS does not use the XDG GlobalShortcuts portal — and no script can change it. Workarounds:
+This is an **OBS core limitation** on Wayland — OBS does not implement the XDG GlobalShortcuts portal ([obs-studio#10538](https://github.com/obsproject/obs-studio/issues/10538)) — and no script can change it. Options:
 
-- Install the **WaylandHotkeys** plugin (`com.obsproject.Studio.Plugin.WaylandHotkeys` for Flatpak), then set the keys under your desktop's *Global Shortcuts* settings; or
-- Bind a desktop-level shortcut to `obs-cmd` / `obs-cli` over **obs-websocket**.
+- **Community plugins** implement the portal for OBS, e.g. WaylandHotkeys (Flatpak: `com.obsproject.Studio.Plugin.WaylandHotkeys`) or [obs-wayland-hotkeys](https://github.com/leia-uwu/obs-wayland-hotkeys). They register the hotkeys returned by `obs_enum_hotkeys` and need a recent Qt plus GNOME 49+ / KDE Plasma 6+.
+  > **Untested:** their documentation describes OBS's *built-in* actions. Whether hotkeys registered by **scripts** (this script's *Toggle Zoom* / *Toggle Follow*) are exposed is not documented — if you try it, please report back.
+- **obs-websocket**: bind a desktop-level shortcut to `obs-cmd` / `obs-cli`. This works regardless of how the hotkey was registered.
 
 ---
 
