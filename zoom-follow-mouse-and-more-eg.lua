@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Zoom, Follow Mouse and MORE for OBS Studio
--- Version 2.2.0 (2026)
+-- Version 2.2.1 (2026)
 -- ============================================================================
 
 local obs = obslua
@@ -64,12 +64,24 @@ local VALID_SOURCE_TYPES = {
 -- FFI PLATFORM MODULE
 -- ============================================================================
 
+-- Forward declaration. ffi_platform (below) reads app_state, but the table is
+-- only built further down the file. Without this `local`, a Lua `local app_state`
+-- declared later is NOT in scope here, so those reads resolved to a nil global:
+-- the Mouse Cache Duration setting was silently ignored, and the unknown-OS
+-- fallbacks would have raised "attempt to index a nil value".
+local app_state
+
 local ffi_platform = {
     initialized = false,
     os_type = nil,
+    -- True when we can read the GLOBAL cursor position. False on Wayland and
+    -- whenever platform init failed: callers then zoom to the source centre
+    -- instead of silently using a bogus (0,0) cursor.
+    cursor_available = false,
     -- Windows
     windows_loaded = false,
     -- Linux
+    is_wayland = false,
     x11 = nil,
     xrandr = nil,
     x11_display = nil,
@@ -121,54 +133,152 @@ local function init_windows_ffi()
     return true
 end
 
+-- Try several SONAME variants. Distros commonly ship only libFoo.so.N at
+-- runtime; the bare libFoo.so symlink lives in the -devel package.
+local function ffi_load_any(names)
+    for _, name in ipairs(names) do
+        local ok, lib = pcall(ffi.load, name)
+        if ok and lib then
+            return lib
+        end
+    end
+    return nil
+end
+
+-- Detect a Wayland session.
+-- Wayland deliberately provides NO protocol for a client to read the global
+-- cursor position, and under XWayland XQueryPointer only reports the pointer
+-- while it is over an X11 surface — never over the native Wayland desktop we
+-- capture. So live mouse tracking is not obtainable there from a Lua script.
+-- Environment hint only: true = Wayland, false = X11, nil = inconclusive.
+-- Env vars are not reliable on their own (a Flatpak sandbox may see neither
+-- WAYLAND_DISPLAY nor XDG_SESSION_TYPE), so init_linux_ffi() confirms with a
+-- runtime probe for the XWAYLAND extension.
+local function detect_wayland_env()
+    local session = os.getenv("XDG_SESSION_TYPE")
+    if session then
+        session = session:lower()
+        if session == "wayland" then
+            return true
+        end
+        if session == "x11" then
+            return false
+        end
+    end
+    local wayland_display = os.getenv("WAYLAND_DISPLAY")
+    if wayland_display and wayland_display ~= "" then
+        return true
+    end
+    return nil
+end
+
+-- A rootless XWayland server advertises the "XWAYLAND" X extension; a classic
+-- Xorg server does not. Its presence means the real desktop is Wayland, so the
+-- global cursor position is not readable even though the X11 calls themselves
+-- appear to succeed. XQueryExtension is the officially recommended check.
+--
+-- The extension only exists since xorgproto 2022.2, so a "false" here is NOT
+-- proof of Xorg. That is why the environment hint is consulted first and this
+-- probe is only used to CONFIRM a Wayland session the env vars failed to reveal
+-- (e.g. inside a Flatpak sandbox).
+local function probe_xwayland(display)
+    local found = false
+    pcall(function()
+        local opcode = ffi.new("int[1]")
+        local event = ffi.new("int[1]")
+        local error_ = ffi.new("int[1]")
+        if ffi_platform.x11.XQueryExtension(display, "XWAYLAND", opcode, event, error_) ~= 0 then
+            found = true
+        end
+    end)
+    return found
+end
+
 -- Initialize FFI definitions and handles for Linux
 local function init_linux_ffi()
     if ffi_platform.x11_display ~= nil then
         return true
     end
-    
-    local success, err = pcall(function()
+
+    local ok_cdef, cdef_err = pcall(function()
         ffi.cdef[[
-            typedef struct {
-                int x, y;
-                int width, height;
-            } XRRMonitorInfo;
-            
             typedef void* Display;
+            typedef unsigned long XID;
             typedef unsigned long Window;
-            
-            Display* XOpenDisplay(const char*);
-            void XCloseDisplay(Display*);
-            Window DefaultRootWindow(Display*);
-            XRRMonitorInfo* XRRGetMonitors(Display*, Window, int, int*);
-            void XRRFreeMonitors(XRRMonitorInfo*);
-            
+            typedef unsigned long Atom;
+            typedef unsigned long RROutput;
+            typedef int Bool;
+
+            /* Real layout from Xrandr.h. The previous 4-int declaration was wrong:
+               it omitted name/primary/automatic/noutput, so both the field offsets
+               and the array stride were incorrect. */
             typedef struct {
-                int x, y;
-                int dummy1, dummy2, dummy3;
-                int dummy4, dummy5, dummy6;
-            } XButtonEvent;
-            
-            int XQueryPointer(Display*, Window, Window*, Window*, int*, int*, int*, int*, unsigned int*);
+                Atom name;
+                Bool primary;
+                Bool automatic;
+                int noutput;
+                int x;
+                int y;
+                int width;
+                int height;
+                int mwidth;
+                int mheight;
+                RROutput *outputs;
+            } XRRMonitorInfo;
+
+            Display* XOpenDisplay(const char*);
+            int XCloseDisplay(Display*);
+            Window XDefaultRootWindow(Display*);
+            int XDefaultScreen(Display*);
+            int XDisplayWidth(Display*, int);
+            int XDisplayHeight(Display*, int);
+            Bool XQueryPointer(Display*, Window, Window*, Window*, int*, int*, int*, int*, unsigned int*);
+            Bool XQueryExtension(Display*, const char*, int*, int*, int*);
+
+            XRRMonitorInfo* XRRGetMonitors(Display*, Window, Bool, int*);
+            void XRRFreeMonitors(XRRMonitorInfo*);
         ]]
-        
-        ffi_platform.x11 = ffi.load("X11")
-        ffi_platform.xrandr = ffi.load("Xrandr")
-        
+    end)
+    if not ok_cdef then
+        return false, "X11 cdef failed: " .. tostring(cdef_err)
+    end
+
+    ffi_platform.x11 = ffi_load_any({"X11", "libX11.so.6", "libX11.so"})
+    if not ffi_platform.x11 then
+        return false, "Failed to load libX11 (tried X11, libX11.so.6, libX11.so)"
+    end
+
+    local ok_open, open_err = pcall(function()
         ffi_platform.x11_display = ffi_platform.x11.XOpenDisplay(nil)
         if ffi_platform.x11_display ~= nil then
-            ffi_platform.x11_root = ffi_platform.x11.DefaultRootWindow(ffi_platform.x11_display)
+            -- NOTE: DefaultRootWindow() is an Xlib *macro*, not a symbol exported
+            -- by libX11. Declaring/calling it made LuaJIT fail to resolve the
+            -- symbol, which aborted the whole Linux init and left get_mouse_pos()
+            -- returning (0,0) forever. The real function is XDefaultRootWindow.
+            ffi_platform.x11_root = ffi_platform.x11.XDefaultRootWindow(ffi_platform.x11_display)
         end
     end)
-    
-    if not success then
-        return false, err
+    if not ok_open then
+        return false, "X11 init failed: " .. tostring(open_err)
     end
-    
+
     if ffi_platform.x11_display == nil then
-        return false, "Failed to open X11 display"
+        return false, "Failed to open X11 display (no X server / XWayland reachable)"
     end
-    
+
+    -- Confirm the session type. Trust an explicit "wayland" env hint; otherwise
+    -- ask the X server itself, since env vars can be absent inside a Flatpak
+    -- sandbox and would then hide a Wayland desktop behind XWayland.
+    if detect_wayland_env() == true then
+        ffi_platform.is_wayland = true
+    else
+        ffi_platform.is_wayland = probe_xwayland(ffi_platform.x11_display)
+    end
+
+    -- Xrandr is OPTIONAL: without it we fall back to the default screen size,
+    -- rather than failing the whole platform init (which would kill the mouse).
+    ffi_platform.xrandr = ffi_load_any({"Xrandr", "libXrandr.so.2", "libXrandr.so"})
+
     return true
 end
 
@@ -214,21 +324,31 @@ function ffi_platform.init()
     if ffi_platform.os_type == "Windows" then
         success, err = init_windows_ffi()
     elseif ffi_platform.os_type == "Linux" then
+        -- Env-based default, used if init fails before the runtime probe can run.
+        ffi_platform.is_wayland = (detect_wayland_env() == true)
+        -- init_linux_ffi() refines this with the XWAYLAND extension probe.
         success, err = init_linux_ffi()
     elseif ffi_platform.os_type == "OSX" then
         success, err = init_macos_ffi()
     else
-        -- Fallback for unknown OS
+        -- Fallback for unknown OS: no cursor source available
         ffi_platform.monitors = {{left = 0, top = 0, right = app_state.default_monitor_width, bottom = app_state.default_monitor_height}}
         ffi_platform.initialized = true
+        ffi_platform.cursor_available = false
         return true
     end
-    
+
     if not success then
         return false, err
     end
-    
+
     ffi_platform.initialized = true
+    -- We can only track the mouse when the global cursor position is readable.
+    -- On Wayland it is not (see detect_wayland_env / probe_xwayland), so zoom
+    -- falls back to the centre of the source.
+    ffi_platform.cursor_available = (ffi_platform.os_type == "Windows")
+        or (ffi_platform.os_type == "OSX")
+        or (ffi_platform.os_type == "Linux" and not ffi_platform.is_wayland)
     return true
 end
 
@@ -265,22 +385,39 @@ function ffi_platform.get_monitors()
         
     elseif ffi_platform.os_type == "Linux" then
         if ffi_platform.x11_display ~= nil then
-            local count = ffi.new("int[1]")
-            local info = ffi_platform.xrandr.XRRGetMonitors(ffi_platform.x11_display, ffi_platform.x11_root, 1, count)
-            
-            if info ~= nil then
-                for i = 0, count[0] - 1 do
-                    table.insert(monitors, {
-                        left = info[i].x,
-                        top = info[i].y,
-                        right = info[i].x + info[i].width,
-                        bottom = info[i].y + info[i].height
-                    })
-                end
-                ffi_platform.xrandr.XRRFreeMonitors(info)
+            if ffi_platform.xrandr ~= nil then
+                pcall(function()
+                    local count = ffi.new("int[1]")
+                    local info = ffi_platform.xrandr.XRRGetMonitors(ffi_platform.x11_display, ffi_platform.x11_root, 1, count)
+
+                    if info ~= nil then
+                        for i = 0, count[0] - 1 do
+                            table.insert(monitors, {
+                                left = info[i].x,
+                                top = info[i].y,
+                                right = info[i].x + info[i].width,
+                                bottom = info[i].y + info[i].height
+                            })
+                        end
+                        ffi_platform.xrandr.XRRFreeMonitors(info)
+                    end
+                end)
+            end
+
+            -- Fallback when Xrandr is unavailable or reported nothing:
+            -- treat the default X screen as a single monitor.
+            if #monitors == 0 then
+                pcall(function()
+                    local screen = ffi_platform.x11.XDefaultScreen(ffi_platform.x11_display)
+                    local w = ffi_platform.x11.XDisplayWidth(ffi_platform.x11_display, screen)
+                    local h = ffi_platform.x11.XDisplayHeight(ffi_platform.x11_display, screen)
+                    if w > 0 and h > 0 then
+                        table.insert(monitors, {left = 0, top = 0, right = w, bottom = h})
+                    end
+                end)
             end
         end
-        
+
     elseif ffi_platform.os_type == "OSX" then
         if ffi_platform.core_graphics ~= nil then
             local active_displays = ffi.new("CGDirectDisplayID[?]", MAX_DISPLAYS)
@@ -403,13 +540,16 @@ function ffi_platform.cleanup()
     ffi_platform.monitors = {}
     ffi_platform.mouse_cache = {x = 0, y = 0, timestamp = 0}
     ffi_platform.initialized = false
+    ffi_platform.cursor_available = false
 end
 
 -- ============================================================================
 -- STATE MANAGEMENT
 -- ============================================================================
 
-local app_state = {
+-- Assigns the forward-declared local above (do NOT re-declare with `local`,
+-- or ffi_platform would again see a nil global).
+app_state = {
     zoom = {
         active = false,
         value = 3.0,
@@ -1094,6 +1234,10 @@ local function on_zoom_tick()
     -- Interpolate the viewport CENTER toward the mouse, keeping viewport SIZE fixed.
     -- This prevents zoom-level drift that happens when interpolating 4 crop values independently.
     if zoom_state == "zoomed_in" and app_state.follow.active then
+        -- No readable global cursor (Wayland): nothing to follow.
+        if not ffi_platform.cursor_available then
+            return
+        end
         local mx, my = ffi_platform.get_mouse_pos()
         local dx = math.abs(mx - app_state.last_mouse_pos.x)
         local dy = math.abs(my - app_state.last_mouse_pos.y)
@@ -1167,8 +1311,15 @@ local function calc_zoom_crop(mouse_x, mouse_y, zoom_level, src_w, src_h)
         return {left = 0, top = 0, right = 0, bottom = 0}
     end
 
-    local monitor = monitor_at(mouse_x, mouse_y)
-    local mx_src, my_src = map_mouse_to_source(mouse_x, mouse_y, monitor, src_w, src_h)
+    local mx_src, my_src
+    if ffi_platform.cursor_available then
+        local monitor = monitor_at(mouse_x, mouse_y)
+        mx_src, my_src = map_mouse_to_source(mouse_x, mouse_y, monitor, src_w, src_h)
+    else
+        -- No readable global cursor (Wayland, or platform init failed):
+        -- zoom to the centre of the source rather than to a bogus (0,0).
+        mx_src, my_src = src_w / 2, src_h / 2
+    end
 
     local view_w = math.max(4, math.min(math.floor(src_w / zoom_level), src_w))
     local view_h = math.max(4, math.min(math.floor(src_h / zoom_level), src_h))
@@ -1226,7 +1377,7 @@ local function start_zoom_in(src_w, src_h)
     -- follows the mouse without a second hotkey. Keeping follow.active true also
     -- keeps the tick timer alive past the zoom-in completion (see on_zoom_tick).
     -- The Follow hotkey still works as a live freeze/unfreeze toggle.
-    if app_state.follow.auto then
+    if app_state.follow.auto and ffi_platform.cursor_available then
         app_state.follow.active = true
     end
     app_state.last_mouse_pos = {x = mx, y = my}
@@ -1364,7 +1515,15 @@ local function on_follow_hotkey(pressed)
         log("warning", "Follow can only be activated when zoom is active")
         return
     end
-    
+
+    -- Without a readable global cursor there is nothing to follow. Say so once,
+    -- loudly, instead of toggling a mode that silently does nothing.
+    if not ffi_platform.cursor_available then
+        print("[Zoom and Follow] Follow is unavailable: the global mouse position cannot be read"
+            .. (ffi_platform.is_wayland and " on Wayland. Use an Xorg session (e.g. 'GNOME on Xorg') for mouse follow." or "."))
+        return
+    end
+
     app_state.follow.active = not app_state.follow.active
     if app_state.follow.active then
         ensure_zoom_timer()
@@ -1536,13 +1695,24 @@ end
 
 -- Script description
 function script_description()
-    return "Zoom and follow mouse for OBS Studio. Capability-based source detection (works with any video source, nested scenes and groups), HiDPI-aware tracking, multi-monitor support. Version 2.2.0"
+    return "Zoom and follow mouse for OBS Studio. Capability-based source detection (works with any video source, nested scenes and groups), HiDPI-aware tracking, multi-monitor support. Mouse follow requires Windows, macOS or an Xorg session (not Wayland). Version 2.2.1"
 end
 
 -- Script properties
 function script_properties()
     local props = obs.obs_properties_create()
-    
+
+    -- Warn in the UI when the cursor cannot be tracked (Wayland / failed init),
+    -- so the behaviour (zoom to centre, no follow) is not a surprise.
+    if not ffi_platform.cursor_available then
+        local notice = ffi_platform.is_wayland
+            and "⚠ Wayland session: the global mouse position cannot be read by any application, "
+                .. "so mouse follow is disabled and zoom targets the centre of the source. "
+                .. "Log in to an Xorg session (e.g. 'GNOME on Xorg') for mouse-centred zoom and follow."
+            or "⚠ The mouse position is unavailable on this system: zoom targets the centre of the source."
+        obs.obs_properties_add_text(props, "cursor_notice", notice, obs.OBS_TEXT_INFO)
+    end
+
     -- Main settings
     obs.obs_properties_add_float_slider(props, "zoom_value", "Zoom Value", 1.1, MAX_ZOOM_VALUE, 0.1)
     obs.obs_properties_add_int(props, "zoom_animation_duration", "Zoom In Duration (ms)", 1, 60000, 1)
@@ -1643,15 +1813,32 @@ end
 
 -- Script loading
 function script_load(settings)
+    -- Read debug_mode FIRST. script_update() only runs at the END of script_load,
+    -- so without this the init diagnostics below were silently swallowed by the
+    -- debug gate inside log() — which is exactly why platform init failures were
+    -- invisible in user bug reports.
+    app_state.debug_mode = obs.obs_data_get_bool(settings, "debug_mode")
+
     -- Initialize FFI platform
     local success, err = ffi_platform.init()
     if not success then
-        log("error", "Failed to initialize FFI platform: " .. tostring(err))
+        -- Unconditional: this is fatal for mouse tracking, the user must see it.
+        print("[Zoom and Follow] [ERROR] Failed to initialize platform: " .. tostring(err))
     end
-    
+
     -- Get monitor information
     app_state.monitors = ffi_platform.get_monitors()
     log("info", "Detected " .. #app_state.monitors .. " monitor(s)")
+
+    -- Tell the user up-front when the cursor cannot be tracked, instead of
+    -- silently zooming into the top-left corner.
+    if ffi_platform.is_wayland then
+        print("[Zoom and Follow] Wayland session detected: no application can read the global mouse "
+            .. "position on Wayland, so mouse follow is disabled and zoom targets the centre of the "
+            .. "source. Use an Xorg session (e.g. 'GNOME on Xorg') for mouse-centred zoom and follow.")
+    elseif not ffi_platform.cursor_available then
+        print("[Zoom and Follow] Mouse position unavailable: zoom will target the centre of the source.")
+    end
     
     -- Register hotkeys
     app_state.zoom_hotkey_id = obs.obs_hotkey_register_frontend(ZOOM_HOTKEY_NAME, "Toggle Zoom", on_zoom_hotkey)

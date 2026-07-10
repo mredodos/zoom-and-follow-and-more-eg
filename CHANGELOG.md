@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.1] - 2026
+
+### Fixed — Linux mouse tracking (it had never actually worked)
+
+- **`DefaultRootWindow` is an Xlib *macro*, not a symbol exported by `libX11`.** The FFI declared and called it, so LuaJIT failed to resolve the symbol, the whole Linux platform init aborted, and `get_mouse_pos()` returned a hardcoded `(0,0)` from then on. The visible result: zoom always jumped to the **top-left corner** and follow never moved. Now calls the real `XDefaultRootWindow`. This affected **every** Linux session — Xorg included, not just Wayland.
+- **`XRRMonitorInfo` had the wrong struct layout** (it omitted `name`, `primary`, `automatic`, `noutput` before the geometry fields), which would have produced garbage monitor rectangles the moment the above was fixed. Corrected to the real `Xrandr.h` layout.
+- **More robust library loading**: also tries `libX11.so.6` / `libXrandr.so.2`, since most distros ship only the versioned SONAME. `libXrandr` is now **optional** — if it is missing, monitor geometry falls back to the default X screen size instead of disabling mouse tracking entirely.
+
+### Added — honest Wayland handling
+
+- **Wayland is now detected reliably.** Environment variables (`XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`) are only a hint — they can be missing inside a Flatpak sandbox — so the script also probes the X server at runtime for the **`XWAYLAND` extension** (via `XQueryExtension`, the officially recommended check), which a rootless XWayland server advertises and a classic Xorg server does not. Since that extension only exists from `xorgproto 2022.2`, the environment hint is consulted first and the probe is used to *confirm* a session the env vars failed to reveal.
+- Monitor geometry needs `XRRGetMonitors` (libXrandr ≥ 1.5.0); on older systems the script now falls back to the default X screen size instead of failing.
+- Wayland deliberately provides **no protocol for an application to read the global cursor position**, so on Wayland the script now **zooms to the centre of the source and disables follow**, stating so clearly in the Script Log and in the script properties — instead of silently zooming into a corner. For mouse-centred zoom and follow, use an Xorg session (e.g. *GNOME on Xorg*).
+
+### Fixed — diagnostics
+
+- **Platform init errors are no longer swallowed.** `debug_mode` is now read at the very start of `script_load`, before platform init, and fatal init failures print unconditionally. Previously these lines were emitted before `debug_mode` was applied, so they never appeared in bug reports — which is why this Linux bug went unnoticed for so long.
+
+### Notes
+
+- Global hotkeys firing **only when the OBS window has focus** is an **OBS core limitation on Wayland** (OBS does not use the XDG GlobalShortcuts portal), not a script issue. See the README for workarounds.
+
 ## [2.2.0] - 2026
 
 ### Robust source detection (fixes #9, #10, #14)

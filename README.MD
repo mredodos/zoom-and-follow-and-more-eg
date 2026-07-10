@@ -4,7 +4,7 @@
 
 **Dynamic zoom and mouse tracking for any video source in OBS.**
 
-![Version](https://img.shields.io/badge/version-2.2.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.2.1-blue?style=flat-square)
 ![OBS](https://img.shields.io/badge/OBS_Studio-30.0%2B-purple?style=flat-square)
 ![Lua](https://img.shields.io/badge/Lua-5.1%2B-blue?style=flat-square&logo=lua)
 ![License](https://img.shields.io/github/license/mredodos/zoom-and-follow-and-more-eg?style=flat-square&color=green)
@@ -121,6 +121,9 @@ Press your zoom hotkey to zoom in at the mouse position. Press again to zoom out
 | `Error loading file: ... unexpected symbol near '<'` | You saved the GitHub **HTML page** instead of the script. Re-download from **Releases** or the **Raw** link (see [Install](#1-install)). |
 | Zoom doesn't activate | Check source has valid dimensions. Press **Ctrl+F** on source first. |
 | Zoom centers but doesn't follow the mouse | Follow is a separate action: press the **Toggle Follow** hotkey, or enable **Auto-follow while zoomed** in settings. (On high-DPI/Retina displays tracking is fixed in 2.2.0.) |
+| Zoom always jumps to the **top-left corner** (Linux) | Fixed in **2.2.1** — the Linux cursor code failed to initialise, so the mouse always read `(0,0)`. Update to 2.2.1. |
+| Zoom goes to the **centre** and follow is disabled (Linux) | You're on a **Wayland** session; the global cursor position is unreadable there. Use an **Xorg** session for follow — see [Platform support](#platform-support-for-mouse-tracking). |
+| Hotkeys only work when OBS is focused (Linux) | OBS core limitation on Wayland — see [Platform support](#platform-support-for-mouse-tracking) for workarounds. |
 | Flickering at edges | Increase **Crop Edge Threshold** or **Mouse Deadzone** in Advanced Settings. |
 | Follow feels laggy | Lower **Update Interval** (e.g. 8 ms) and/or lower **Mouse Deadzone**. |
 | Mouse escapes viewport at high zoom | Normal at extreme zoom levels (tiny viewport). Lower Update Interval helps. |
@@ -144,6 +147,33 @@ Since **v2.2.0** the script detects sources by **capability** — *any* source t
 | **Any** | Browser, Media/VLC, Image, and other video sources |
 
 > If a scene contains several video sources (e.g. a webcam overlay plus a screen capture), the script prefers a known *capture* source. Use **Preferred Source** to override the choice.
+
+---
+
+## Platform support for mouse tracking
+
+Zooming works everywhere. **Mouse tracking** (mouse-centred zoom + follow) needs the OS to expose the global cursor position:
+
+| Session | Mouse-centred zoom | Follow |
+|---|---|---|
+| **Windows** | ✅ | ✅ |
+| **macOS** | ✅ | ✅ |
+| **Linux — Xorg / X11** (incl. *GNOME on Xorg*) | ✅ | ✅ |
+| **Linux — Wayland** | ❌ zooms to source **centre** | ❌ disabled |
+
+### Why not Wayland?
+
+Wayland **deliberately provides no protocol** for an application to read the global cursor position — a client only receives pointer coordinates while the cursor is over its own window. Under XWayland, `XQueryPointer` reports the real position only while the cursor is over an X11 surface, never over the native Wayland desktop you are capturing. This affects every OBS zoom script, not just this one.
+
+Since **v2.2.1** the script detects Wayland, says so in the Script Log and in the script properties, disables follow, and zooms to the **centre of the source** rather than silently jumping into a corner. For mouse-centred zoom and follow, log in to an **Xorg** session (on GDM: click the ⚙ gear on the login screen → *GNOME on Xorg*).
+
+### Hotkeys only work when OBS is focused (Wayland)
+
+This is an **OBS core limitation** on Wayland — OBS does not implement the XDG GlobalShortcuts portal ([obs-studio#10538](https://github.com/obsproject/obs-studio/issues/10538)) — and no script can change it. Options:
+
+- **Community plugins** implement the portal for OBS, e.g. WaylandHotkeys (Flatpak: `com.obsproject.Studio.Plugin.WaylandHotkeys`) or [obs-wayland-hotkeys](https://github.com/leia-uwu/obs-wayland-hotkeys). They register the hotkeys returned by `obs_enum_hotkeys` and need a recent Qt plus GNOME 49+ / KDE Plasma 6+.
+  > **Untested:** their documentation describes OBS's *built-in* actions. Whether hotkeys registered by **scripts** (this script's *Toggle Zoom* / *Toggle Follow*) are exposed is not documented — if you try it, please report back.
+- **obs-websocket**: bind a desktop-level shortcut to `obs-cmd` / `obs-cli`. This works regardless of how the hotkey was registered.
 
 ---
 
