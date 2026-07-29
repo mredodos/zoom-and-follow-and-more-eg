@@ -290,19 +290,38 @@ local function init_macos_ffi()
     
     local success, err = pcall(function()
         ffi.cdef[[
-            typedef struct CGDirectDisplayID *CGDirectDisplayID;
+            typedef double CGFloat;
+            typedef uint32_t CGDirectDisplayID;
             typedef uint32_t CGDisplayCount;
-            typedef struct CGRect CGRect;
-            typedef struct CGPoint CGPoint;
+            typedef int32_t CGError;
+            typedef struct {
+                CGFloat x;
+                CGFloat y;
+            } CGPoint;
+            typedef struct {
+                CGFloat width;
+                CGFloat height;
+            } CGSize;
+            typedef struct {
+                CGPoint origin;
+                CGSize size;
+            } CGRect;
             
-            int CGGetActiveDisplayList(CGDisplayCount maxDisplays, CGDirectDisplayID *activeDisplays, CGDisplayCount *displayCount);
+            CGError CGGetActiveDisplayList(CGDisplayCount maxDisplays, CGDirectDisplayID *activeDisplays, CGDisplayCount *displayCount);
             CGRect CGDisplayBounds(CGDirectDisplayID display);
             CGPoint CGEventGetLocation(void* event);
             void* CGEventCreate(void* source);
             void CFRelease(void* cf);
         ]]
         
-        ffi_platform.core_graphics = ffi.load("CoreGraphics", true)
+        -- A bare "CoreGraphics" name becomes a relative libCoreGraphics.dylib
+        -- lookup, which hardened/notarized OBS builds reject on modern macOS.
+        -- The canonical absolute framework path is resolved by dyld even when
+        -- the framework binary itself lives in the shared cache.
+        ffi_platform.core_graphics = ffi.load(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            true
+        )
     end)
     
     if not success then
